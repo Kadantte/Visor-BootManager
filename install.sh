@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+ESP=""
+DO_BUILD=1
+DO_BOOT_ENTRY=0
+DO_FALLBACK=0
+FORCE_CONFIG=0
+
+VISOR_DIR_REL="EFI/visor"          
+EFI_NAME="visor_x64.efi"
+
+say()  { printf '\033[1;34m::\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --esp)          ESP="${2:-}"; shift 2 ;;
+        --no-build)     DO_BUILD=0; shift ;;
+        --boot-entry)   DO_BOOT_ENTRY=1; shift ;;
+        --fallback)     DO_FALLBACK=1; shift ;;
+        --force-config) FORCE_CONFIG=1; shift ;;
+        -h|--help)      usage ;;
+        *)              die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+detect_esp() {
+    if command -v bootctl >/dev/null 2>&1; then
+        local p
+        p="$(bootctl --print-esp-path 2>/dev/null || true)"
+        [ -n "$p" ] && { echo "$p"; return; }
+    fi
+    local m
+    for m in /boot/efi /efi /boot; do
+        if mountpoint -q "$m" 2>/dev/null && \
+           [ "$(findmnt -no FSTYPE "$m" 2>/dev/null)" = vfat ]; then
+            echo "$m"; return
+        fi
+    done
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk -o MOUNTPOINT,PARTTYPENAME -rn 2>/dev/null | \
+            awk -F' ' '/EFI System/ && $1!="" {print $1; exit}'
+    fi
+}
+
+if [ -z "$ESP" ]; then
+    say "Detecting EFI System Partition..."
+    ESP="$(detect_esp || true)"
+fi
+[ -n "$ESP" ] || die "Could not find the ESP. Re-run with: --esp /your/esp/mount"
+[ -d "$ESP" ] || die "ESP path does not exist: $ESP"
+say "Using ESP: $ESP"
+
+DEST="$ESP/$VISOR_DIR_REL"
+
+if [ "$DO_BUILD" -eq 1 ]; then
+    say "Building $EFI_NAME ..."
+    make --no-print-directory
+fi
+[ -f "$EFI_NAME" ] || die "$EFI_NAME not found - build first or drop --no-build."
+
+if [ ! -w "$ESP" ]; then
+    die "No write permission on $ESP. Re-run with sudo."
+fi
+
+say "Installing into $DEST"
+mkdir -p "$DEST/icons" "$DEST/backgrounds" "$DEST/themes"
+install -m 0644 "$EFI_NAME" "$DEST/$EFI_NAME"
+
+if [ -d assets/icons ]; then
+    cp -f assets/icons/*.png "$DEST/icons/" 2>/dev/null || true
+fi
+if [ -d assets/backgrounds ]; then
+    cp -f assets/backgrounds/*.png "$DEST/backgrounds/" 2>/dev/null || true
+fi
+if [ -d assets/themes ]; then
+    cp -f assets/themes/*.conf "$DEST/themes/" 2>/dev/null || true
+fi
+
+CONF="$DEST/boot.conf"
+if [ -f "$CONF" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
+    say "Keeping existing config: $CONF (use --force-config to replace)"
+else
+    install -m 0644 boot.conf.example "$CONF"
+    say "Wrote default config: $CONF"
+    warn "Edit $CONF and set your kernel paths / root PARTUUID before rebooting."
+fi
+
+if [ "$DO_FALLBACK" -eq 1 ]; then
+    mkdir -p "$ESP/EFI/BOOT"
+    install -m 0644 "$EFI_NAME" "$ESP/EFI/BOOT/BOOTX64.EFI"
+    say "Installed fallback: $ESP/EFI/BOOT/BOOTX64.EFI"
+fi
+
+if [ "$DO_BOOT_ENTRY" -eq 1 ]; then
+    command -v efibootmgr >/dev/null 2>&1 || die "efibootmgr not installed."
+    src="$(findmnt -no SOURCE "$ESP")" || die "Cannot resolve ESP device."
+    disk="/dev/$(lsblk -no PKNAME "$src")"
+    partnum="$(lsblk -no PARTN "$src" 2>/dev/null || \
+               echo "$src" | grep -o '[0-9]*$')"
+    [ -b "$disk" ] || die "Could not determine ESP disk (got '$disk')."
+    loader="\\${VISOR_DIR_REL//\//\\}\\$EFI_NAME"
+    if efibootmgr | grep -q 'Visor'; then
+        say "A 'Visor' boot entry already exists; leaving it untouched."
+    else
+        say "Creating UEFI boot entry 'Visor' -> $disk part $partnum"
+        efibootmgr --create --disk "$disk" --part "$partnum" \
+                   --label "Visor" --loader "$loader" >/dev/null
+    fi
+fi
+
+say "Done. Visor is installed at $DEST"
