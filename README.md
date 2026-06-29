@@ -182,6 +182,7 @@ back-slashes, e.g. `\EFI\visor\icons\arch.png`. Colors are `#RRGGBB`.
 | `text_menu`       | `1` = use text-mode instead of a graphical menu. Fallback menu if firmware denies rendering                |
 | `resolution`      | Resolution at which the menu is rendered. `native` = default. `max` = highest resolution firmware offers. `WxH` = custom resolution, eg `resolution=1920x1080`. |
 | `quiet`           | `1` = black screen during hand-off · `0` = show progress text.                                             |
+| `autoboot`        | `1` = skip the menu and boot immediately — the single entry if there's only one, otherwise the remembered/`default=` entry. Hold any key at power-on to force the menu. `0` = always show the menu. |
 | `center_info`     | `1` = show selected entry details near the bottom. Path-only when `show_names=1`                           |
 | `entries_per_page`| Entries shown per page. Default `3`.                                                                       |
 | `title`           | Menu title. Empty/absent = `Visor` · `none` = no title · else verbatim.                                    |
