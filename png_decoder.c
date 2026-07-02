@@ -49,6 +49,18 @@ static UINT32 read_bits(bit_reader_t *br, UINTN count) {
     return result;
 }
 
+static int add_overflow_uintn(UINTN a, UINTN b, UINTN *out) {
+    if (~(UINTN)0 - a < b) return 1;
+    *out = a + b;
+    return 0;
+}
+
+static int mul_overflow_uintn(UINTN a, UINTN b, UINTN *out) {
+    if (a && b > ~(UINTN)0 / a) return 1;
+    *out = a * b;
+    return 0;
+}
+
 #define MAXBITS 15
 
 typedef struct {
@@ -106,6 +118,7 @@ static EFI_STATUS png_decompress(UINT8 *input, UINTN input_size,
     UINT8 *window = efi_allocate_pool(32768);
     if (!window) return EFI_OUT_OF_RESOURCES;
     UINTN window_pos = 0;
+    UINTN window_have = 0;
     UINTN max_output = *output_size;
     EFI_STATUS status = EFI_SUCCESS;
 
@@ -126,12 +139,15 @@ static EFI_STATUS png_decompress(UINT8 *input, UINTN input_size,
             byte += 4;
             if (byte + len > input_size) { status = EFI_INVALID_PARAMETER; break; }
 
-            for (UINTN i = 0; i < len && out_pos < max_output; i++) {
+            UINTN copied = 0;
+            for (UINTN i = 0; i < len && out_pos < max_output; i++, copied++) {
                 UINT8 b = input[byte + i];
                 output[out_pos++] = b;
                 window[window_pos++] = b;
                 window_pos &= 0x7FFF;
+                if (window_have < 32768) window_have++;
             }
+            if (copied != len) { status = EFI_BUFFER_TOO_SMALL; break; }
             br.bit_pos += len * 8;
         }
         else if (btype == 1 || btype == 2) {
@@ -155,6 +171,10 @@ static EFI_STATUS png_decompress(UINT8 *input, UINTN input_size,
                 UINTN hlit  = read_bits(&br, 5) + 257;
                 UINTN hdist = read_bits(&br, 5) + 1;
                 UINTN hclen = read_bits(&br, 4) + 4;
+                if (hlit > 288 || hdist > 32) {
+                    status = EFI_INVALID_PARAMETER;
+                    break;
+                }
 
                 static const UINT8 code_length_order[19] = {
                     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
@@ -205,7 +225,8 @@ static EFI_STATUS png_decompress(UINT8 *input, UINTN input_size,
                         output[out_pos++] = (UINT8)symbol;
                         window[window_pos++] = (UINT8)symbol;
                         window_pos &= 0x7FFF;
-                    } else break;
+                        if (window_have < 32768) window_have++;
+                    } else { status = EFI_BUFFER_TOO_SMALL; break; }
                 } else if (symbol == 256) {
                     break;
                 } else if (symbol > 285) {
@@ -219,16 +240,20 @@ static EFI_STATUS png_decompress(UINT8 *input, UINTN input_size,
                     if (dist_symbol < 0 || dist_symbol > 29) { status = EFI_INVALID_PARAMETER; break; }
                     UINTN dist        = dist_base[dist_symbol];
                     dist += read_bits(&br, dist_extra[dist_symbol]);
+                    if (dist == 0 || dist > window_have) { status = EFI_INVALID_PARAMETER; break; }
 
-                    for (UINTN k = 0; k < length && out_pos < max_output; k++) {
+                    UINTN copied = 0;
+                    for (UINTN k = 0; k < length && out_pos < max_output; k++, copied++) {
                         UINTN src_pos = (window_pos - dist) & 0x7FFF;
                         UINT8 b = window[src_pos];
                         output[out_pos++] = b;
                         window[window_pos++] = b;
                         window_pos &= 0x7FFF;
+                        if (window_have < 32768) window_have++;
                     }
+                    if (copied != length) { status = EFI_BUFFER_TOO_SMALL; break; }
                 }
-                if (br_exhausted(&br) && out_pos < max_output) { status = EFI_INVALID_PARAMETER; break; }
+                if (br_exhausted(&br)) { status = EFI_INVALID_PARAMETER; break; }
             }
             if (status != EFI_SUCCESS) break;
         } else {
@@ -358,7 +383,10 @@ icon_t* png_load(UINT8 *data, UINTN size) {
                 UINTN ncap = idat_cap ? idat_cap : 8192;
                 while (ncap < idat_size + chunk_len) ncap *= 2;
                 UINT8 *nb = efi_allocate_pool(ncap);
-                if (!nb) break;
+                if (!nb) {
+                    if (idat_data) efi_free_pool(idat_data);
+                    return NULL;
+                }
                 if (idat_data && idat_size > 0) CopyMem(nb, idat_data, idat_size);
                 if (idat_data) efi_free_pool(idat_data);
                 idat_data = nb;
@@ -393,29 +421,78 @@ icon_t* png_load(UINT8 *data, UINTN size) {
 
     UINTN bpp;
     switch (color_type) {
-        case 0: bpp = 1; break;
-        case 2: bpp = 3; break;
-        case 3: bpp = 1; break;
-        case 4: bpp = 2; break;
-        case 6: bpp = 4; break;
-        default: bpp = 4;
+        case 0:
+            if (bit_depth != 8 && bit_depth != 16) {
+                efi_log(L"  ERROR: unsupported grayscale PNG bit depth");
+                efi_free_pool(idat_data);
+                return NULL;
+            }
+            bpp = (bit_depth == 16) ? 2 : 1;
+            break;
+        case 2:
+            if (bit_depth != 8) {
+                efi_log(L"  ERROR: unsupported RGB PNG bit depth");
+                efi_free_pool(idat_data);
+                return NULL;
+            }
+            bpp = 3;
+            break;
+        case 4:
+            if (bit_depth != 8) {
+                efi_log(L"  ERROR: unsupported grayscale-alpha PNG bit depth");
+                efi_free_pool(idat_data);
+                return NULL;
+            }
+            bpp = 2;
+            break;
+        case 6:
+            if (bit_depth != 8) {
+                efi_log(L"  ERROR: unsupported RGBA PNG bit depth");
+                efi_free_pool(idat_data);
+                return NULL;
+            }
+            bpp = 4;
+            break;
+        default:
+            efi_log(L"  ERROR: unsupported PNG color type");
+            efi_free_pool(idat_data);
+            return NULL;
     }
 
-    UINTN  uncomp_size = height * (1 + width * bpp);
+    UINTN row_payload = 0;
+    UINTN row_bytes = 0;
+    UINTN uncomp_size = 0;
+    if (mul_overflow_uintn((UINTN)width, bpp, &row_payload) ||
+        add_overflow_uintn(row_payload, 1, &row_bytes) ||
+        mul_overflow_uintn((UINTN)height, row_bytes, &uncomp_size)) {
+        efi_log(L"  ERROR: PNG dimensions overflow scratch size");
+        efi_free_pool(idat_data);
+        return NULL;
+    }
+
     UINT8 *uncomp      = efi_allocate_pool(uncomp_size);
     if (!uncomp) {
         { CHAR16 d[96]; SPrint(d, sizeof(d),
             L"  ERROR: out of memory for %d KB scratch buffer",
             (int)(uncomp_size / 1024)); efi_log(d); }
+        efi_free_pool(idat_data);
         return NULL;
     }
     UINTN  final_size  = uncomp_size;
+
+    if ((idat_data[0] & 0x0F) != 8 ||
+        (((UINT16)idat_data[0] << 8) | idat_data[1]) % 31 != 0) {
+        efi_log(L"  ERROR: PNG has an invalid zlib header");
+        efi_free_pool(idat_data);
+        efi_free_pool(uncomp);
+        return NULL;
+    }
 
     EFI_STATUS status = png_decompress(idat_data + 2, idat_size - 2,
                                        uncomp, &final_size);
     efi_free_pool(idat_data);
 
-    if (EFI_ERROR(status)) {
+    if (EFI_ERROR(status) || final_size != uncomp_size) {
         efi_log(L"  ERROR: DEFLATE decompression failed (corrupt/unsupported)");
         efi_free_pool(uncomp);
         return NULL;
@@ -428,15 +505,17 @@ icon_t* png_load(UINT8 *data, UINTN size) {
     icon->height   = height;
     icon->scaled_size = 0;
     icon->scaled   = NULL;
-    icon->pixels   = efi_allocate_pool(width * height * sizeof(UINT32));
+    UINTN pixel_count = 0;
+    UINTN pixel_bytes = 0;
+    if (mul_overflow_uintn((UINTN)width, (UINTN)height, &pixel_count) ||
+        mul_overflow_uintn(pixel_count, sizeof(UINT32), &pixel_bytes)) {
+        efi_log(L"  ERROR: PNG dimensions overflow pixel buffer size");
+        efi_free_pool(icon);
+        efi_free_pool(uncomp);
+        return NULL;
+    }
+    icon->pixels   = efi_allocate_pool(pixel_bytes);
     if (!icon->pixels) { efi_free_pool(icon); efi_free_pool(uncomp); return NULL; }
-
-    UINTN row_bytes;
-    if      (color_type == 2) row_bytes = width * 3;
-    else if (color_type == 6) row_bytes = width * 4;
-    else if (color_type == 4) row_bytes = width * 2;
-    else                      row_bytes = (width * bit_depth * bpp + 7) / 8;
-    row_bytes += 1;
 
     UINT8 *prev_row = NULL;
 
@@ -469,7 +548,7 @@ icon_t* png_load(UINT8 *data, UINTN size) {
                 UINT8 gray = pixel_data[idx]; a = pixel_data[idx+1];
                 r = g = b = gray;
             } else if (color_type == 0) {
-                r = (bit_depth == 16) ? pixel_data[idx * 2] : pixel_data[idx];
+                r = pixel_data[idx];
                 g = b = r;
             } else {
                 r = g = b = pixel_data[idx];
