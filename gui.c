@@ -60,12 +60,67 @@ static UINT32 color_to_u32(color_t c) {
     return (0xFF << 24) | (c.r << 16) | (c.g << 8) | c.b;
 }
 
-static UINT32 blend_color(color_t c1, color_t c2, UINT8 alpha) __attribute__((unused));
-static UINT32 blend_color(color_t c1, color_t c2, UINT8 alpha) {
-    UINT8 r = (c1.r * (255 - alpha) + c2.r * alpha) / 255;
-    UINT8 g = (c1.g * (255 - alpha) + c2.g * alpha) / 255;
-    UINT8 b = (c1.b * (255 - alpha) + c2.b * alpha) / 255;
-    return (0xFF << 24) | (r << 16) | (g << 8) | b;
+static UINTN clamp_uintn(UINTN v, UINTN lo, UINTN hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static UINTN ui_base(gui_state_t *state) {
+    UINTN a = state->screen_width < state->screen_height
+            ? state->screen_width : state->screen_height;
+    return a ? a : 800;
+}
+
+static UINTN default_icon_size(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 9, 64, 128);
+}
+
+static UINTN default_icon_spacing(gui_state_t *state, UINTN icon_size) {
+    UINTN by_res = ui_base(state) / 12;
+    UINTN by_icon = icon_size * 7 / 10;
+    UINTN s = by_res > by_icon ? by_res : by_icon;
+    return clamp_uintn(s, 48, 104);
+}
+
+static UINTN default_name_px(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 38, 18, 28);
+}
+
+static UINTN default_title_px(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 11, 48, 86);
+}
+
+static UINTN default_power_px(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 32, 20, 28);
+}
+
+static UINTN default_power_icon_size(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 18, 40, 56);
+}
+
+static UINTN default_aux_text_px(gui_state_t *state) {
+    return clamp_uintn(ui_base(state) / 34, 20, 30);
+}
+
+static void gui_fill_rect(gui_state_t *state, UINTN x, UINTN y,
+                          UINTN w, UINTN h, color_t color);
+
+static int add_overflow_uintn(UINTN a, UINTN b, UINTN *out) {
+    if (~(UINTN)0 - a < b) return 1;
+    *out = a + b;
+    return 0;
+}
+
+static int mul_overflow_uintn(UINTN a, UINTN b, UINTN *out) {
+    if (a && b > ~(UINTN)0 / a) return 1;
+    *out = a * b;
+    return 0;
+}
+
+static void wipe16(CHAR16 *s, UINTN n) {
+    volatile CHAR16 *p = (volatile CHAR16*)s;
+    while (n--) *p++ = 0;
 }
 
 static UINT32* get_pixel(gui_state_t *state, UINTN x, UINTN y) {
@@ -128,6 +183,120 @@ void gui_present_band(gui_state_t *state, INTN y, INTN h) {
     blit_rows(state, y, h);
 }
 
+static UINTN fade_frame_count(gui_state_t *state) {
+    int sp = state ? state->fade_speed : 0;
+    if (sp < 1) sp = 10;
+    if (sp > 10) sp = 10;
+
+    return (UINTN)(12 - sp);
+}
+
+static int gui_animation_on(gui_state_t *state) {
+    return state && state->animation;
+}
+
+static INTN ease_permille(INTN frame, INTN frames) {
+    if (frames <= 0 || frame >= frames) return 1000;
+    if (frame <= 0) return 0;
+
+    INTN t = frame * 1000 / frames;
+    return (t * t * (3000 - 2 * t) + 500000) / 1000000;
+}
+
+static UINTN ease_alpha(INTN frame, INTN frames) {
+    return (UINTN)(ease_permille(frame, frames) * 255 / 1000);
+}
+
+static UINTN fade_alpha(UINTN frame, UINTN frames) {
+    if (frames == 0 || frame >= frames) return 255;
+    return (frame * 255 + frames / 2) / frames;
+}
+
+static void fade_write_black(gui_state_t *state, UINTN px) {
+    for (UINTN i = 0; i < px; i++)
+        state->backbuffer[i] = 0xFF000000u;
+}
+
+static void fade_write_snapshot(gui_state_t *state, UINT32 *snapshot, UINTN px) {
+    for (UINTN i = 0; i < px; i++)
+        state->backbuffer[i] = snapshot[i];
+}
+
+static void fade_write_scaled(gui_state_t *state, UINT32 *snapshot,
+                              UINTN px, UINTN alpha) {
+    if (alpha == 0) {
+        fade_write_black(state, px);
+        return;
+    }
+    if (alpha >= 255) {
+        fade_write_snapshot(state, snapshot, px);
+        return;
+    }
+
+    UINT32 a = (UINT32)((alpha * 256 + 127) / 255);
+    for (UINTN i = 0; i < px; i++) {
+        UINT32 p = snapshot[i];
+        UINT32 rb = (((p & 0x00FF00FFu) * a + 0x00800080u) >> 8) & 0x00FF00FFu;
+        UINT32 g  = (((p & 0x0000FF00u) * a + 0x00008000u) >> 8) & 0x0000FF00u;
+        state->backbuffer[i] = 0xFF000000u | rb | g;
+    }
+}
+
+static void gui_fade_from_snapshot(gui_state_t *state, UINT32 *snapshot,
+                                   int fade_in) {
+    if (!state || !state->backbuffer || !snapshot) return;
+    UINTN px = state->screen_width * state->screen_height;
+    if (!gui_animation_on(state)) {
+        if (fade_in)
+            fade_write_snapshot(state, snapshot, px);
+        else
+            fade_write_black(state, px);
+        gui_present(state);
+        return;
+    }
+
+    UINTN frames = fade_frame_count(state);
+    UINTN first = 1;
+    UINTN delay = (state->fade_speed >= 9) ? 0 : (UINTN)(10 - state->fade_speed);
+
+    for (UINTN f = first; f <= frames; f++) {
+        UINTN a = fade_alpha(f, frames);
+        if (!fade_in) a = 255 - a;
+        fade_write_scaled(state, snapshot, px, a);
+        gui_present(state);
+        if (delay && f < frames) efi_sleep(delay);
+    }
+}
+
+static void gui_fade_in_current(gui_state_t *state) {
+    if (!state || !state->backbuffer) return;
+    UINTN px = state->screen_width * state->screen_height;
+    if (!gui_animation_on(state)) {
+        gui_present(state);
+        return;
+    }
+    UINT32 *snapshot = efi_allocate_pool(px * sizeof(UINT32));
+    if (!snapshot) return;
+    for (UINTN i = 0; i < px; i++) snapshot[i] = state->backbuffer[i];
+    gui_fade_from_snapshot(state, snapshot, 1);
+    efi_free_pool(snapshot);
+}
+
+void gui_fade_out(gui_state_t *state) {
+    if (!state || !state->backbuffer) return;
+    UINTN px = state->screen_width * state->screen_height;
+    if (!gui_animation_on(state)) {
+        fade_write_black(state, px);
+        gui_present(state);
+        return;
+    }
+    UINT32 *snapshot = efi_allocate_pool(px * sizeof(UINT32));
+    if (!snapshot) return;
+    for (UINTN i = 0; i < px; i++) snapshot[i] = state->backbuffer[i];
+    gui_fade_from_snapshot(state, snapshot, 0);
+    efi_free_pool(snapshot);
+}
+
 EFI_STATUS gui_init(gui_state_t *state) {
 
     EFI_STATUS status = BS->HandleProtocol(
@@ -181,7 +350,9 @@ EFI_STATUS gui_init(gui_state_t *state) {
     state->blur = 0;
     state->blur_title = 0;
     state->blur_color = COLOR_WHITE;
+    state->animation = 1;
     state->anim_speed = 0;
+    state->fade_speed = 0;
     state->anim_cross = 0;
     state->anim_frames = 12;
 
@@ -251,6 +422,8 @@ EFI_STATUS gui_init(gui_state_t *state) {
 
     state->editor_enabled = 1;
     state->editing = 0;
+    state->edit_secret = 0;
+    state->edit_title = NULL;
     state->edit_len = 0;
     state->edit_cursor = 0;
     state->override_cmdline = NULL;
@@ -360,7 +533,7 @@ EFI_STATUS gui_set_mode(gui_state_t *state, UINTN want_w, UINTN want_h, int want
     return EFI_SUCCESS;
 }
 
-void gui_fill_rect(gui_state_t *state, UINTN x, UINTN y, UINTN w, UINTN h, color_t color) {
+static void gui_fill_rect(gui_state_t *state, UINTN x, UINTN y, UINTN w, UINTN h, color_t color) {
     UINT32 pixel = color_to_u32(color);
     for (UINTN j = y; j < y + h && j < state->screen_height; j++) {
         for (UINTN i = x; i < x + w && i < state->screen_width; i++) {
@@ -478,49 +651,70 @@ static void draw_image_sized(gui_state_t *state, icon_t *icon,
     draw_image_sized_a(state, icon, x, y, size, 255);
 }
 
-void gui_draw_image(gui_state_t *state, icon_t *icon, UINTN x, UINTN y) {
-    draw_image_sized(state, icon, x, y, ICON_SIZE);
+static UINT8 sharpen_cov(UINTN a) {
+    if (a == 0 || a >= 255) return (UINT8)a;
+    if (a < 24) return 0;
+    if (a > 232) return 255;
+    INTN v = (INTN)a - 128;
+    v = 128 + v * 5 / 4;
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    return (UINT8)v;
 }
 
-static UINTN px_height(UINTN scale) { return scale * 16; }
-
 static UINT8 sample_cov(const unsigned char *cov, UINTN w, UINTN h,
-                        UINTN sx256, UINTN sy256) {
-    UINTN x0 = sx256 >> 8, y0 = sy256 >> 8;
-    if (x0 >= w) x0 = w ? w - 1 : 0;
-    if (y0 >= h) y0 = h ? h - 1 : 0;
+                        INTN sx1024, INTN sy1024) {
+    if (!w || !h) return 0;
+    if (sx1024 < 0) sx1024 = 0;
+    if (sy1024 < 0) sy1024 = 0;
+    UINTN x0 = (UINTN)sx1024 >> 10, y0 = (UINTN)sy1024 >> 10;
+    if (x0 >= w) x0 = w - 1;
+    if (y0 >= h) y0 = h - 1;
     UINTN x1 = (x0 + 1 < w) ? x0 + 1 : x0;
     UINTN y1 = (y0 + 1 < h) ? y0 + 1 : y0;
-    UINTN fx = sx256 & 0xFF, fy = sy256 & 0xFF;
+    INTN fx = sx1024 & 0x3FF, fy = sy1024 & 0x3FF;
     UINTN c00 = cov[y0 * w + x0], c10 = cov[y0 * w + x1];
     UINTN c01 = cov[y1 * w + x0], c11 = cov[y1 * w + x1];
-    UINTN top = c00 + ((c10 - c00) * fx >> 8);
-    UINTN bot = c01 + ((c11 - c01) * fx >> 8);
-    return (UINT8)(top + (((INTN)bot - (INTN)top) * (INTN)fy >> 8));
+    INTN top = (INTN)c00 + (((INTN)c10 - (INTN)c00) * fx >> 10);
+    INTN bot = (INTN)c01 + (((INTN)c11 - (INTN)c01) * fx >> 10);
+    INTN v = top + ((bot - top) * fy >> 10);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    return sharpen_cov((UINTN)v);
+}
+
+static INTN scale_metric(INTN v, UINTN dh, UINTN size) {
+    INTN num = v * (INTN)dh;
+    INTN half = (INTN)size / 2;
+    return num >= 0 ? (num + half) / (INTN)size
+                    : -((-num + half) / (INTN)size);
 }
 
 static UINTN blend_glyph(gui_state_t *state, const glyph_t *g, UINT32 rgb,
                          INTN dx, INTN dyTop, UINTN size_px, UINTN dh, INTN master) {
-    if (g->w == 0 || g->h == 0) return g->advance * dh / size_px;
-    if (!g_glyph_cov) return g->advance * dh / size_px;
+    UINTN advance = ((UINTN)g->advance * dh + size_px / 2) / size_px;
+    if (g->w == 0 || g->h == 0) return advance;
+    if (!g_glyph_cov) return advance;
     const unsigned char *cov = g_glyph_cov + g->pixel_offset;
-    UINTN dw = (UINTN)g->w * dh / size_px;
-    UINTN ddh = (UINTN)g->h * dh / size_px;
-    if (dw == 0 || ddh == 0) return g->advance * dh / size_px;
+    UINTN dw = ((UINTN)g->w * dh + size_px / 2) / size_px;
+    UINTN ddh = ((UINTN)g->h * dh + size_px / 2) / size_px;
+    if (dw == 0 || ddh == 0) return advance;
 
     UINT8 fr = (rgb >> 16) & 0xFF, fg = (rgb >> 8) & 0xFF, fb = rgb & 0xFF;
     for (UINTN j = 0; j < ddh; j++) {
-        UINTN sy = (j * g->h * 256) / ddh;
+        INTN sy = ((INTN)((j * 2 + 1) * g->h) - (INTN)ddh) * 1024
+                / (INTN)(ddh * 2);
         INTN py = dyTop + (INTN)j;
         if (py < 0 || py >= (INTN)state->screen_height) continue;
         for (UINTN i = 0; i < dw; i++) {
-            UINTN sx = (i * g->w * 256) / dw;
+            INTN sx = ((INTN)((i * 2 + 1) * g->w) - (INTN)dw) * 1024
+                    / (INTN)(dw * 2);
             UINT8 a = sample_cov(cov, g->w, g->h, sx, sy);
             if (master < 255) a = (UINT8)((UINTN)a * (UINTN)master / 255);
             if (!a) continue;
             INTN px = dx + (INTN)i;
             if (px < 0 || px >= (INTN)state->screen_width) continue;
-            UINT32 *p = get_pixel(state, px, py);
+            UINT32 *p = get_pixel(state, (UINTN)px, (UINTN)py);
             if (!p) continue;
             UINT8 br = (*p >> 16) & 0xFF, bg = (*p >> 8) & 0xFF, bb = *p & 0xFF;
             UINT8 r = (fr * a + br * (255 - a)) / 255;
@@ -529,66 +723,53 @@ static UINTN blend_glyph(gui_state_t *state, const glyph_t *g, UINT32 rgb,
             *p = (0xFFu << 24) | (r << 16) | (gg << 8) | b;
         }
     }
-    return g->advance * dh / size_px;
+    return advance;
 }
 
 static UINTN text_width_px(CHAR16 *text, UINTN dh) {
     if (!text) return 0;
-    UINTN w = 0;
+    UINTN pen = 0;
+    UINTN size = g_font->size;
     while (*text) {
         CHAR16 c = *text++;
         if (c < g_font->first || c > g_font->last) c = '?';
         const glyph_t *g = &g_font->glyphs[c - g_font->first];
-        w += (UINTN)g->advance * dh / g_font->size;
+        pen += (UINTN)g->advance * dh * 64 / size;
     }
-    return w;
+    return (pen + 32) / 64;
 }
 
-static void draw_text_px_a(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
+static void draw_text_px_a(gui_state_t *state, CHAR16 *text, INTN x, INTN y,
                            color_t color, UINTN dh, INTN master) {
     if (!text || master <= 0) return;
     if (master > 255) master = 255;
     font_ensure_decoded();
     UINT32 rgb = color_to_u32(color) & 0x00FFFFFF;
     UINTN size = g_font->size;
-    UINTN baseline = y + (UINTN)g_font->ascent * dh / size;
-    INTN pen = (INTN)x;
+    INTN baseline = y + scale_metric((INTN)g_font->ascent, dh, size);
+    INTN pen64 = x * 64;
     while (*text) {
         CHAR16 c = *text++;
         if (c < g_font->first || c > g_font->last) c = '?';
         const glyph_t *g = &g_font->glyphs[c - g_font->first];
-        INTN gx = pen + (INTN)((INTN)g->left * (INTN)dh / (INTN)size);
-        INTN gyTop = (INTN)baseline - (INTN)((INTN)g->top * (INTN)dh / (INTN)size);
-        pen += (INTN)blend_glyph(state, g, rgb, gx, gyTop, size, dh, master);
+        INTN gx = (pen64 + 32) / 64
+                + scale_metric((INTN)g->left, dh, size);
+        INTN gyTop = (INTN)baseline - scale_metric((INTN)g->top, dh, size);
+        (void)blend_glyph(state, g, rgb, gx, gyTop, size, dh, master);
+        pen64 += (INTN)g->advance * (INTN)dh * 64 / (INTN)size;
     }
 }
 
-static void draw_text_px(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
+static void draw_text_px(gui_state_t *state, CHAR16 *text, INTN x, INTN y,
                          color_t color, UINTN dh) {
     draw_text_px_a(state, text, x, y, color, dh, 255);
 }
 
-static UINTN text_width(CHAR16 *text, UINTN scale) {
-    return text_width_px(text, px_height(scale));
-}
-static void draw_text_scaled(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
-                             color_t color, UINTN scale) {
-    draw_text_px(state, text, x, y, color, px_height(scale));
-}
-static void draw_text_centered(gui_state_t *state, CHAR16 *text, UINTN x, UINTN w,
-                               UINTN y, color_t color, UINTN scale) {
-    UINTN tw = text_width_px(text, px_height(scale));
-    UINTN tx = (tw < w) ? x + (w - tw) / 2 : x;
-    draw_text_px(state, text, tx, y, color, px_height(scale));
-}
-
-void gui_draw_text_small(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
-                         color_t color) {
-    draw_text_px(state, text, x, y, color, 16);
-}
-void gui_draw_text_large(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
-                         color_t color) {
-    draw_text_px(state, text, x, y, color, 32);
+static void draw_text_centered_px(gui_state_t *state, CHAR16 *text, INTN x, UINTN w,
+                                  INTN y, color_t color, UINTN dh) {
+    UINTN tw = text_width_px(text, dh);
+    INTN tx = (tw < w) ? x + (INTN)(w - tw) / 2 : x;
+    draw_text_px(state, text, tx, y, color, dh);
 }
 
 icon_t* gui_load_image(CHAR16 *path) {
@@ -599,10 +780,17 @@ icon_t* gui_load_image(CHAR16 *path) {
     { CHAR16 d[64]; SPrint(d, sizeof(d), L"  image: read %d bytes", (int)buf->size); efi_log(d); }
 
     UINT8 *data = (UINT8*)buf->data;
+    if (buf->size < 2) {
+        efi_log(L"  ERROR: image file is too small");
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
 
     UINT8 png_sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     INTN is_png = 1;
-    for (int i = 0; i < 8; i++) {
+    if (buf->size < sizeof(png_sig)) is_png = 0;
+    for (int i = 0; is_png && i < 8; i++) {
         if (data[i] != png_sig[i]) {
             is_png = 0;
             break;
@@ -611,6 +799,7 @@ icon_t* gui_load_image(CHAR16 *path) {
 
     if (is_png) {
         icon_t *icon = png_load(data, buf->size);
+        efi_free_pool(buf->data);
         efi_free_pool(buf);
         if (!icon) efi_log(L"  ERROR: PNG decode failed");
         return icon;
@@ -618,6 +807,14 @@ icon_t* gui_load_image(CHAR16 *path) {
 
     if (data[0] != 'B' || data[1] != 'M') {
         efi_log(L"  ERROR: image is neither PNG nor BMP");
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
+
+    if (buf->size < 54) {
+        efi_log(L"  ERROR: BMP header is truncated");
+        efi_free_pool(buf->data);
         efi_free_pool(buf);
         return NULL;
     }
@@ -628,37 +825,61 @@ icon_t* gui_load_image(CHAR16 *path) {
     UINT32 compression = *(UINT32*)(data + 30);
     UINT32 data_offset = *(UINT32*)(data + 10);
 
-    if (compression != 0 || (bpp != 24 && bpp != 32)) {
+    if (width == 0 || height == 0 || width > 8192 || height > 8192 ||
+        compression != 0 || (bpp != 24 && bpp != 32) || data_offset >= buf->size) {
+        efi_log(L"  ERROR: unsupported or invalid BMP");
+        efi_free_pool(buf->data);
         efi_free_pool(buf);
         return NULL;
     }
 
+    UINTN bytes_per_px = bpp / 8;
+    UINTN row_raw = 0, row_stride = 0, pixel_array_bytes = 0;
+    UINTN pixel_array_end = 0, pixel_count = 0, pixel_bytes = 0;
+    if (mul_overflow_uintn((UINTN)width, bytes_per_px, &row_raw) ||
+        add_overflow_uintn(row_raw, 3, &row_stride) ||
+        mul_overflow_uintn((UINTN)height, row_stride & ~(UINTN)3, &pixel_array_bytes) ||
+        add_overflow_uintn((UINTN)data_offset, pixel_array_bytes, &pixel_array_end) ||
+        pixel_array_end > buf->size ||
+        mul_overflow_uintn((UINTN)width, (UINTN)height, &pixel_count) ||
+        mul_overflow_uintn(pixel_count, sizeof(UINT32), &pixel_bytes)) {
+        efi_log(L"  ERROR: BMP dimensions or pixel data are invalid");
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
+    row_stride &= ~(UINTN)3;
+
     icon_t *icon = efi_allocate_pool(sizeof(icon_t));
-    if (!icon) { efi_free_pool(buf); return NULL; }
+    if (!icon) {
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
     icon->width = width;
     icon->height = height;
     icon->scaled_size = 0;
     icon->scaled = NULL;
-    icon->pixels = efi_allocate_pool(width * height * sizeof(UINT32));
-    if (!icon->pixels) { efi_free_pool(icon); efi_free_pool(buf); return NULL; }
+    icon->pixels = efi_allocate_pool(pixel_bytes);
+    if (!icon->pixels) {
+        efi_free_pool(icon);
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
 
     UINT8 *src = data + data_offset;
-    UINTN row_padding = (4 - (width * (bpp / 8)) % 4) % 4;
 
     for (UINTN y = 0; y < height; y++) {
+        UINT8 *row = src + ((UINTN)height - 1 - y) * row_stride;
         for (UINTN x = 0; x < width; x++) {
-            UINT8 *pixel;
-            if (bpp == 32) {
-                pixel = src + ((height - 1 - y) * (width * 4 + row_padding * height) + x * 4);
-            } else {
-
-                pixel = src + ((height - 1 - y) * (width * 3 + row_padding) + x * 3);
-            }
+            UINT8 *pixel = row + x * bytes_per_px;
 
             icon->pixels[y * width + x] = (0xFF << 24) | (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
         }
     }
 
+    efi_free_pool(buf->data);
     efi_free_pool(buf);
     return icon;
 }
@@ -692,7 +913,7 @@ void gui_set_background(gui_state_t *state, CHAR16 *path) {
     }
 }
 
-void gui_draw_background(gui_state_t *state) {
+static void gui_draw_background(gui_state_t *state) {
     if (!state->background || !state->background->pixels) {
 
         gui_fill_rect(state, 0, 0, state->screen_width, state->screen_height, state->bg_color);
@@ -724,18 +945,16 @@ static const struct { CHAR16 *label; int action; } POWER_ACTIONS[] = {
 };
 #define POWER_ACTION_COUNT 3
 
-#define POWER_SCALE 2
-
 static void layout_power(gui_state_t *state) {
-    UINTN scale   = POWER_SCALE;
-    UINTN th      = px_height(scale);
+    UINTN th      = default_power_px(state);
     UINTN line_h  = th + 18;
-    UINTN margin  = 30;
+    UINTN margin  = clamp_uintn(ui_base(state) / 26, 28, 46);
 
     icon_t *icon[POWER_ACTION_COUNT] = {
         state->shutdown_icon, state->reboot_icon, state->firmware_icon
     };
-    UINTN isz       = state->power_icon_size ? state->power_icon_size : 40;
+    UINTN isz       = state->power_icon_size ? state->power_icon_size
+                                             : default_power_icon_size(state);
     UINTN icon_line = isz + 16;
 
     UINTN block_h = 0;
@@ -758,7 +977,7 @@ static void layout_power(gui_state_t *state) {
             state->pwr_w[i] = (INTN)isz; state->pwr_h[i] = (INTN)isz;
             y += icon_line;
         } else {
-            UINTN tw = text_width(POWER_ACTIONS[i].label, scale);
+            UINTN tw = text_width_px(POWER_ACTIONS[i].label, th);
             INTN  x  = right_side ? (INTN)(state->screen_width - margin - tw) : (INTN)margin;
             state->pwr_x[i] = x; state->pwr_y[i] = y;
             state->pwr_w[i] = (INTN)tw; state->pwr_h[i] = (INTN)th;
@@ -770,7 +989,7 @@ static void layout_power(gui_state_t *state) {
 }
 
 static void draw_power_actions(gui_state_t *state, int focus_idx) {
-    UINTN scale = POWER_SCALE;
+    UINTN th = default_power_px(state);
     icon_t *icon[POWER_ACTION_COUNT] = {
         state->shutdown_icon, state->reboot_icon, state->firmware_icon
     };
@@ -789,9 +1008,10 @@ static void draw_power_actions(gui_state_t *state, int focus_idx) {
             INTN x = state->pwr_x[i], y = state->pwr_y[i];
 
             CHAR16 first[2] = { label[0], 0 };
-            draw_text_scaled(state, first, x, y, key_color[i], scale);
-            draw_text_scaled(state, label + 1, x + (8 + 2) * scale, y,
-                             focused ? key_color[i] : dim, scale);
+            draw_text_px(state, first, x, y, key_color[i], th);
+            draw_text_px(state, label + 1,
+                         x + (INTN)text_width_px(first, th) + (INTN)(th / 5),
+                         y, focused ? key_color[i] : dim, th);
         }
     }
 }
@@ -936,6 +1156,44 @@ static boot_entry_t* entry_at(gui_state_t *state, UINTN idx) {
     return e;
 }
 
+static UINTN entry_icon_size(boot_entry_t *e, UINTN fallback) {
+    return (e && e->icon_size) ? e->icon_size : fallback;
+}
+
+static UINTN entry_slot_width(gui_state_t *state, boot_entry_t *e,
+                              UINTN icon_size, UINTN name_px) {
+    UINTN w = icon_size;
+    if (state->show_names && e && e->name) {
+        UINTN nw = text_width_px(e->name, name_px);
+        if (nw > w) w = nw;
+    }
+    return w;
+}
+
+static void calc_row_layout(gui_state_t *state, UINTN start, UINTN n,
+                            UINTN sel_local, UINTN is, UINTN isp, UINTN name_px,
+                            UINTN *total_w, INTN *sel_left, UINTN *sel_ei) {
+    UINTN x = 0;
+    boot_entry_t *e = entry_at(state, start);
+
+    *total_w = 0;
+    *sel_left = 0;
+    *sel_ei = is;
+
+    for (UINTN i = 0; i < n && e; i++) {
+        if (i) x += isp;
+        UINTN ei = entry_icon_size(e, is);
+        UINTN slot_w = entry_slot_width(state, e, ei, name_px);
+        if (i == sel_local) {
+            *sel_left = (INTN)x + (INTN)(slot_w - ei) / 2;
+            *sel_ei = ei;
+        }
+        x += slot_w;
+        e = e->next;
+    }
+    *total_w = x;
+}
+
 static void draw_page(gui_state_t *state, UINTN start, UINTN n, UINTN sel_local,
                       UINTN is, UINTN isp, UINTN max_ei, UINTN icon_cy,
                       UINTN name_px, UINTN ul_th, UINTN ul_len_cfg, INTN pad,
@@ -949,18 +1207,8 @@ static void draw_page(gui_state_t *state, UINTN start, UINTN n, UINTN sel_local,
 
     UINTN total_w = 0, sel_ei = is;
     INTN  sel_left = 0;
-    {
-        boot_entry_t *t = entry_at(state, start);
-        UINTN x = 0;
-        for (UINTN i = 0; i < n && t; i++) {
-            UINTN ei = t->icon_size ? t->icon_size : is;
-            total_w += ei + (i + 1 < n ? isp : 0);
-            x += (i ? isp : 0);
-            if (i == sel_local) { sel_left = (INTN)x; sel_ei = ei; }
-            x += ei;
-            t = t->next;
-        }
-    }
+    calc_row_layout(state, start, n, sel_local, is, isp, name_px,
+                    &total_w, &sel_left, &sel_ei);
     UINTN start_x = (state->screen_width > total_w) ? (state->screen_width - total_w) / 2 : 0;
     sel_left += (INTN)start_x;
 
@@ -988,13 +1236,16 @@ static void draw_page(gui_state_t *state, UINTN start, UINTN n, UINTN sel_local,
     boot_entry_t *e = entry_at(state, start);
     UINTN x = start_x;
     for (UINTN i = 0; i < n && e; i++) {
-        UINTN ei = e->icon_size ? e->icon_size : is;
+        if (i) x += isp;
+        UINTN ei = entry_icon_size(e, is);
+        UINTN slot_w = entry_slot_width(state, e, ei, name_px);
+        UINTN icon_x = x + (slot_w - ei) / 2;
         UINTN iy = (icon_cy > ei / 2) ? icon_cy - ei / 2 : 0;
         if (e->icon) {
-            draw_image_sized_a(state, e->icon, x, iy, ei, master);
+            draw_image_sized_a(state, e->icon, icon_x, iy, ei, master);
         } else {
             color_t ph = e->type == 0 ? COLOR_GREEN : COLOR_RED;
-            fill_round_rect(state, (INTN)x, (INTN)iy, (INTN)ei, (INTN)ei,
+            fill_round_rect(state, (INTN)icon_x, (INTN)iy, (INTN)ei, (INTN)ei,
                             12, ph, (UINT8)master);
         }
         if (state->show_names) {
@@ -1005,10 +1256,10 @@ static void draw_page(gui_state_t *state, UINTN start, UINTN n, UINTN sel_local,
                                        state->name_color.g * 7 / 10,
                                        state->name_color.b * 7 / 10 };
             UINTN nw = text_width_px(e->name, name_px);
-            INTN  nx = (INTN)x + (INTN)ei / 2 - (INTN)nw / 2;
-            draw_text_px_a(state, e->name, (UINTN)nx, name_y, name_col, name_px, master);
+            INTN  nx = (INTN)x + (INTN)slot_w / 2 - (INTN)nw / 2;
+            draw_text_px_a(state, e->name, nx, (INTN)name_y, name_col, name_px, master);
         }
-        x += ei + isp;
+        x += slot_w;
         e = e->next;
     }
 }
@@ -1027,11 +1278,11 @@ static void draw_chevrons(gui_state_t *state, UINTN page, UINTN per_page,
         UINTN cw = text_width_px(lt, csz);
         INTN lx = (INTN)start_x - gap - (INTN)cw;
         if (lx < 0) lx = 0;
-        draw_text_px_a(state, lt, (UINTN)lx, (UINTN)cy, cc, csz, master);
+        draw_text_px_a(state, lt, lx, cy, cc, csz, master);
     }
     if ((page + 1) * per_page < state->entry_count) {
         CHAR16 gt[] = L">";
-        draw_text_px_a(state, gt, start_x + total_w + (UINTN)gap, (UINTN)cy, cc, csz, master);
+        draw_text_px_a(state, gt, (INTN)(start_x + total_w) + gap, cy, cc, csz, master);
     }
 }
 
@@ -1084,9 +1335,9 @@ static void draw_center_info(gui_state_t *state, boot_entry_t *e,
                    (INTN)block_w + 2 * fpad, (INTN)block_h + 2 * fpad, master);
     }
     if (want_name)
-        draw_text_px_a(state, e->name, (UINTN)(cx - (INTN)nw / 2), name_y, name_col, name_px, master);
+        draw_text_px_a(state, e->name, cx - (INTN)nw / 2, (INTN)name_y, name_col, name_px, master);
     if (tbuf[0])
-        draw_text_px_a(state, tbuf, (UINTN)(cx - (INTN)pw / 2), path_y, dim, path_px, master);
+        draw_text_px_a(state, tbuf, cx - (INTN)pw / 2, (INTN)path_y, dim, path_px, master);
 }
 
 static void apply_deploy(boot_entry_t *e) {
@@ -1138,8 +1389,8 @@ static void draw_version_info(gui_state_t *state, boot_entry_t *e,
         draw_frost(state, cx - (INTN)block_w / 2 - fpad, (INTN)top_y - fpad,
                    (INTN)block_w + 2 * fpad, (INTN)block_h + 2 * fpad, master);
     }
-    draw_text_px_a(state, e->name, (UINTN)(cx - (INTN)nw / 2), name_y, name_col, name_px, master);
-    draw_text_px_a(state, line, (UINTN)(cx - (INTN)lw / 2), line_y, line_col, path_px, master);
+    draw_text_px_a(state, e->name, cx - (INTN)nw / 2, (INTN)name_y, name_col, name_px, master);
+    draw_text_px_a(state, line, cx - (INTN)lw / 2, (INTN)line_y, line_col, path_px, master);
 }
 
 void gui_draw_menu(gui_state_t *state, int partial) {
@@ -1159,7 +1410,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
         if (state->show_title) {
             CHAR16 *title = (state->title && state->title[0]) ? state->title : L"Visor";
             UINTN title_px = state->title_size ? state->title_size
-                                               : state->screen_height / 12;
+                                               : default_title_px(state);
             UINTN tw = text_width_px(title, title_px);
             UINTN tx = (tw < state->screen_width) ? (state->screen_width - tw) / 2 : 0;
             UINTN ty = state->screen_height / 14;
@@ -1168,7 +1419,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
                 draw_frost(state, (INTN)tx - pad, (INTN)ty - pad,
                            (INTN)tw + 2 * pad, (INTN)title_px + 2 * pad, 255);
             }
-            draw_text_px(state, title, tx, ty, state->title_color, title_px);
+            draw_text_px(state, title, (INTN)tx, (INTN)ty, state->title_color, title_px);
         }
 
         draw_power_actions(state, -1);
@@ -1186,14 +1437,15 @@ void gui_draw_menu(gui_state_t *state, int partial) {
 
     if (state->entry_count == 0) {
         CHAR16 msg[] = L"No boot entries found";
-        draw_text_centered(state, msg, 0, state->screen_width,
-                           state->screen_height / 2, state->fg_color, 2);
+        UINTN msg_px = default_aux_text_px(state);
+        draw_text_centered_px(state, msg, 0, state->screen_width,
+                              (INTN)state->screen_height / 2, state->fg_color, msg_px);
         draw_power_actions(state, state->focus == FOCUS_POWER ? (int)state->power_sel : -1);
         return;
     }
 
-    UINTN is      = state->icon_size    ? state->icon_size    : ICON_SIZE;
-    UINTN isp     = state->icon_spacing ? state->icon_spacing : ICON_SPACING + 40;
+    UINTN is      = state->icon_size    ? state->icon_size    : default_icon_size(state);
+    UINTN isp     = state->icon_spacing ? state->icon_spacing : default_icon_spacing(state, is);
 
     UINTN per_page = state->per_page ? state->per_page : 3;
     UINTN page = state->selected / per_page;
@@ -1212,30 +1464,20 @@ void gui_draw_menu(gui_state_t *state, int partial) {
         }
     }
 
-    UINTN total_w = 0, sel_ei = is;
-    INTN  sel_left = 0;
-    {
-        UINTN x = 0;
-        boot_entry_t *e = entry_at(state, page_start);
-        for (UINTN i = 0; i < page_n && e; i++) {
-            UINTN ei = e->icon_size ? e->icon_size : is;
-            total_w += ei + (i + 1 < page_n ? isp : 0);
-            x += (i ? isp : 0);
-            if (i == sel_local) { sel_left = (INTN)x; sel_ei = ei; }
-            x += ei;
-            e = e->next;
-        }
-    }
-
-    UINTN start_x = (state->screen_width > total_w) ? (state->screen_width - total_w) / 2 : 0;
-    sel_left += (INTN)start_x;
-
     UINTN icon_cy = state->icon_y ? state->icon_y : state->screen_height / 2;
     UINTN row_top = (icon_cy > max_ei / 2) ? icon_cy - max_ei / 2 : 0;
 
-    UINTN name_px = state->name_size ? state->name_size : 16;
+    UINTN name_px = state->name_size ? state->name_size : default_name_px(state);
     UINTN ul_th   = state->underline_thickness ? state->underline_thickness : 4;
     INTN  pad     = 16;
+
+    UINTN total_w = 0, sel_ei = is;
+    INTN  sel_left = 0;
+    calc_row_layout(state, page_start, page_n, sel_local, is, isp, name_px,
+                    &total_w, &sel_left, &sel_ei);
+    UINTN start_x = (state->screen_width > total_w) ? (state->screen_width - total_w) / 2 : 0;
+    sel_left += (INTN)start_x;
+
     UINTN ul_y    = row_top + max_ei + 10;
     UINTN name_y  = ul_y + ul_th + 8;
     UINTN ul_len  = state->underline_length ? state->underline_length
@@ -1278,10 +1520,17 @@ void gui_draw_menu(gui_state_t *state, int partial) {
         tgt[A_BOXH] = ecard_bot - ecard_top;
     }
 
+    int animate = gui_animation_on(state);
     int N = state->anim_frames; if (N < 2) N = 2;
 
     int first = !state->anim_init;
-    if (!first && page != state->prev_page && !state->page_anim) {
+    if (!animate) {
+        state->page_anim = 0;
+        state->anim_active = 0;
+        state->anim_cross = 0;
+    }
+
+    if (animate && !first && page != state->prev_page && !state->page_anim) {
         state->page_anim = 1;
         state->page_frame = 0;
         state->page_old = state->prev_page;
@@ -1290,7 +1539,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
 
     if (state->page_anim) {
         state->page_frame++;
-        INTN fin = state->page_frame * 255 / N; if (fin > 255) fin = 255;
+        INTN fin = ease_alpha(state->page_frame, N); if (fin > 255) fin = 255;
         INTN fout = 255 - fin;
 
         state->band_n = 1;
@@ -1344,14 +1593,22 @@ void gui_draw_menu(gui_state_t *state, int partial) {
         int changed = 0;
         for (int k = 0; k < 9; k++) if (tgt[k] != state->anim_to[k]) changed = 1;
         if (changed) {
-            for (int k = 0; k < 9; k++) {
-                state->anim_from[k] = state->anim_cur[k];
-                state->anim_to[k]   = tgt[k];
+            if (animate) {
+                for (int k = 0; k < 9; k++) {
+                    state->anim_from[k] = state->anim_cur[k];
+                    state->anim_to[k]   = tgt[k];
+                }
+                state->anim_frame  = 0;
+                state->anim_active = 1;
+                int zc = ((state->focus == FOCUS_POWER) != (state->prev_focus == FOCUS_POWER));
+                state->anim_cross = state->blur ? zc : 0;
+            } else {
+                for (int k = 0; k < 9; k++)
+                    state->anim_cur[k] = state->anim_from[k] = state->anim_to[k] = tgt[k];
+                state->anim_frame = 0;
+                state->anim_active = 0;
+                state->anim_cross = 0;
             }
-            state->anim_frame  = 0;
-            state->anim_active = 1;
-            int zc = ((state->focus == FOCUS_POWER) != (state->prev_focus == FOCUS_POWER));
-            state->anim_cross = state->blur ? zc : 0;
         }
     }
     if (state->anim_active) {
@@ -1361,10 +1618,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
             state->anim_active = 0;
             state->anim_cross = 0;
         } else if (!state->anim_cross) {
-            INTN t = state->anim_frame * 1000 / N;
-            INTN e = (t < 500)
-                   ? (2 * t * t) / 1000
-                   : 1000 - ((2000 - 2 * t) * (2000 - 2 * t)) / 2000;
+            INTN e = ease_permille(state->anim_frame, N);
             for (int k = 0; k < 9; k++)
                 state->anim_cur[k] = state->anim_from[k]
                                    + (state->anim_to[k] - state->anim_from[k]) * e / 1000;
@@ -1372,7 +1626,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
     }
 
     int cross = state->anim_active && state->anim_cross;
-    INTN fin = cross ? (state->anim_frame * 255 / N) : 255;
+    INTN fin = cross ? ease_alpha(state->anim_frame, N) : 255;
     INTN fout = 255 - fin;
 
     INTN ilo[6], ihi[6]; int ni = 0;
@@ -1462,23 +1716,26 @@ void gui_draw_menu(gui_state_t *state, int partial) {
     UINTN x = start_x;
     state->hit_n = 0;
     for (UINTN i = 0; i < page_n && entry; i++) {
-        UINTN ei = entry->icon_size ? entry->icon_size : is;
+        if (i) x += isp;
+        UINTN ei = entry_icon_size(entry, is);
+        UINTN slot_w = entry_slot_width(state, entry, ei, name_px);
+        UINTN icon_x = x + (slot_w - ei) / 2;
         UINTN iy = (icon_cy > ei / 2) ? icon_cy - ei / 2 : 0;
 
         if (state->hit_n < 32) {
             int h = state->hit_n++;
             state->hit_x[h] = (INTN)x;
             state->hit_y[h] = (INTN)iy;
-            state->hit_w[h] = (INTN)ei;
-            state->hit_h[h] = (INTN)ei;
+            state->hit_w[h] = (INTN)slot_w;
+            state->hit_h[h] = (INTN)((name_y + name_px > iy) ? (name_y + name_px - iy) : ei);
             state->hit_idx[h] = page_start + i;
         }
 
         if (entry->icon) {
-            draw_image_sized(state, entry->icon, x, iy, ei);
+            draw_image_sized(state, entry->icon, icon_x, iy, ei);
         } else {
             color_t placeholder = entry->type == 0 ? COLOR_GREEN : COLOR_RED;
-            fill_round_rect(state, (INTN)x, (INTN)iy, ei, ei,
+            fill_round_rect(state, (INTN)icon_x, (INTN)iy, ei, ei,
                             12, placeholder, 255);
         }
 
@@ -1494,11 +1751,11 @@ void gui_draw_menu(gui_state_t *state, int partial) {
                                       state->name_color.b * 7 / 10 };
             }
             UINTN nw = text_width_px(entry->name, name_px);
-            INTN  nx = (INTN)x + (INTN)ei / 2 - (INTN)nw / 2;
-            draw_text_px(state, entry->name, nx, name_y, name_col, name_px);
+            INTN  nx = (INTN)x + (INTN)slot_w / 2 - (INTN)nw / 2;
+            draw_text_px(state, entry->name, nx, (INTN)name_y, name_col, name_px);
         }
 
-        x += ei + isp;
+        x += slot_w;
         entry = entry->next;
     }
 
@@ -1513,7 +1770,7 @@ void gui_draw_menu(gui_state_t *state, int partial) {
             INTN vm = 255;
             if (state->ver_fading) {
                 int N = state->anim_frames; if (N < 2) N = 2;
-                INTN f = state->ver_frame * 255 / N; if (f > 255) f = 255;
+                INTN f = ease_alpha(state->ver_frame, N); if (f > 255) f = 255;
                 vm = state->ver_dir > 0 ? f : 255 - f;
             }
             draw_version_info(state, se, ci_top, name_px, vm);
@@ -1534,11 +1791,13 @@ void gui_draw_menu(gui_state_t *state, int partial) {
         if (remaining > 0) {
             CHAR16 buf[40];
             SPrint(buf, sizeof(buf), L"Booting in %ds", (int)remaining);
-            UINTN cw = text_width(buf, 2);
-            UINTN cx = (state->power_position == POWER_POS_BOTTOMLEFT)
-                       ? state->screen_width - 30 - cw : 30;
-            draw_text_scaled(state, buf, cx, state->screen_height - 30 - 16,
-                             state->fg_color, 2);
+            UINTN countdown_px = default_aux_text_px(state);
+            UINTN cw = text_width_px(buf, countdown_px);
+            INTN cx = (state->power_position == POWER_POS_BOTTOMLEFT)
+                      ? (INTN)state->screen_width - 30 - (INTN)cw : 30;
+            draw_text_px(state, buf, cx,
+                         (INTN)state->screen_height - 30 - (INTN)countdown_px,
+                         state->fg_color, countdown_px);
         }
     }
 }
@@ -1621,22 +1880,33 @@ static void draw_editor_overlay(gui_state_t *state) {
                         state->box_radius ? (INTN)state->box_radius : 14,
                         COLOR_BLACK, 215);
 
-    draw_text_px_a(state, L"Edit boot options   (Enter = boot, Esc = cancel)",
-                   bx + 20, by + 12, state->highlight_color, th * 3 / 4, 255);
+    CHAR16 *title = state->edit_title ? state->edit_title
+                                      : L"Edit boot options   (Enter = boot, Esc = cancel)";
+    draw_text_px_a(state, title, (INTN)bx + 20, (INTN)by + 12, state->underline_color, th * 3 / 4, 255);
 
     UINTN tx = bx + 20, ty = by + 12 + th;
-    draw_text_px_a(state, state->edit_buf, tx, ty, COLOR_WHITE, th, 255);
+    CHAR16 secret_buf[512];
+    CHAR16 *shown = state->edit_buf;
+    if (state->edit_secret) {
+        for (UINTN i = 0; i < state->edit_len && i < 511; i++) secret_buf[i] = '*';
+        secret_buf[state->edit_len < 511 ? state->edit_len : 511] = 0;
+        shown = secret_buf;
+    }
+    draw_text_px_a(state, shown, (INTN)tx, (INTN)ty, COLOR_WHITE, th, 255);
 
     CHAR16 tmp[512];
     UINTN k = 0;
-    for (; k < state->edit_cursor && k < 511; k++) tmp[k] = state->edit_buf[k];
+    for (; k < state->edit_cursor && k < 511; k++) tmp[k] = state->edit_secret ? '*' : state->edit_buf[k];
     tmp[k] = 0;
     UINTN caret = tx + text_width_px(tmp, th);
-    fill_rect_alpha(state, (INTN)caret, (INTN)ty, 2, (INTN)th, COLOR_WHITE, 255);
+    fill_rect_alpha(state, (INTN)caret, (INTN)ty, 2, (INTN)th,
+                    state->underline_color, 255);
 }
 
 static void editor_enter(gui_state_t *state) {
     boot_entry_t *e = entry_at(state, state->selected);
+    state->edit_secret = 0;
+    state->edit_title = NULL;
     state->edit_len = 0;
     if (e && e->cmdline)
         while (e->cmdline[state->edit_len] && state->edit_len < 511) {
@@ -1648,10 +1918,20 @@ static void editor_enter(gui_state_t *state) {
     state->editing = 1;
 }
 
+static void prompt_enter(gui_state_t *state, CHAR16 *title) {
+    state->edit_secret = 1;
+    state->edit_title = title;
+    state->edit_len = 0;
+    state->edit_cursor = 0;
+    state->edit_buf[0] = 0;
+    state->editing = 1;
+}
+
 static int editor_key(gui_state_t *state, EFI_INPUT_KEY *key) {
     if (key->UnicodeChar == 0x0D) {
         state->edit_buf[state->edit_len] = 0;
-        state->override_cmdline = efi_strdup(state->edit_buf);
+        if (!state->edit_secret)
+            state->override_cmdline = efi_strdup(state->edit_buf);
         state->editing = 0;
         return 1;
     }
@@ -1824,6 +2104,7 @@ boot_entry_t* gui_run(gui_state_t *state) {
     INTN last_remaining = -2;
     int  need_redraw = 1;
     int  full_redraw = 1;
+    int  intro_fade = 1;
 
     while (state->running) {
         if (need_redraw) {
@@ -1835,13 +2116,17 @@ boot_entry_t* gui_run(gui_state_t *state) {
             }
             gui_draw_menu(state, !full_redraw);
             if (state->editing) draw_editor_overlay(state);
-            if (full_redraw || state->editing) {
+            if (intro_fade && full_redraw && !state->editing) {
+                gui_fade_in_current(state);
+                intro_fade = 0;
+            } else if (full_redraw || state->editing) {
                 gui_present(state);
             } else {
                 for (int b = 0; b < state->band_n; b++)
                     gui_present_band(state, state->band_y[b], state->band_h[b]);
                 if (ghost_y >= 0) gui_present_band(state, ghost_y, CUR_H);
             }
+            if (state->editing) intro_fade = 0;
             need_redraw = state->anim_active || state->page_anim;
             full_redraw = 0;
             if (state->cursor_active && !state->editing)
@@ -1877,7 +2162,7 @@ boot_entry_t* gui_run(gui_state_t *state) {
                 } else if (key.UnicodeChar == 0x1B ||
                            (key.UnicodeChar == 0x00 && key.ScanCode == 0x17)) {
                     if (se) { se->deploy_sel = se->deploy_default; apply_deploy(se); }
-                    if (state->center_info) {
+                    if (state->center_info || !gui_animation_on(state)) {
                         state->version_mode = 0; state->ver_fading = 0;
                     } else {
                         state->ver_dir = -1; state->ver_frame = 0; state->ver_fading = 1;
@@ -1902,8 +2187,10 @@ boot_entry_t* gui_run(gui_state_t *state) {
                     state->version_mode = 1;
                     se->deploy_sel = se->deploy_default;
                     apply_deploy(se);
-                    if (!state->center_info) {
+                    if (!state->center_info && gui_animation_on(state)) {
                         state->ver_dir = 1; state->ver_frame = 0; state->ver_fading = 1;
+                    } else {
+                        state->ver_fading = 0;
                     }
                     need_redraw = 1; full_redraw = 1;
                 }
@@ -2022,6 +2309,48 @@ boot_entry_t* gui_run(gui_state_t *state) {
         selected = selected->next;
     }
     return selected;
+}
+
+EFI_STATUS gui_prompt_password(gui_state_t *state, CHAR16 *title, CHAR16 **out) {
+    EFI_STATUS status;
+    EFI_INPUT_KEY key;
+    int running = 1;
+    int accepted = 0;
+
+    if (!state || !out) return EFI_INVALID_PARAMETER;
+    *out = NULL;
+
+    prompt_enter(state, title ? title : L"Password   (Enter = boot, Esc = cancel)");
+
+    while (running) {
+        gui_draw_menu(state, 0);
+        draw_editor_overlay(state);
+        gui_present(state);
+
+        status = ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
+        if (EFI_ERROR(status)) {
+            efi_sleep(30);
+            continue;
+        }
+
+        int r = editor_key(state, &key);
+        if (r == 1) { accepted = 1; running = 0; }
+        else if (r < 0) { running = 0; }
+    }
+
+    state->edit_secret = 0;
+    state->edit_title = NULL;
+    state->editing = 0;
+
+    if (!accepted) {
+        wipe16(state->edit_buf, 512);
+        state->edit_len = state->edit_cursor = 0;
+        return EFI_ABORTED;
+    }
+    *out = efi_strdup(state->edit_buf);
+    wipe16(state->edit_buf, 512);
+    state->edit_len = state->edit_cursor = 0;
+    return *out ? EFI_SUCCESS : EFI_OUT_OF_RESOURCES;
 }
 
 static void free_icon(icon_t *ic) {
