@@ -259,42 +259,10 @@ void efi_fclose(efi_file_t *file) {
 
 UINTN efi_fread(efi_file_t *file, void *buf, UINTN size) {
     if (!file || !file->handle || !buf) return 0;
-    file->handle->Read(file->handle, &size, buf);
-    return size;
-}
-
-int efi_file_exists(CHAR16 *path) {
-    efi_file_t *f = efi_fopen(path);
-    if (f) {
-        efi_fclose(f);
-        return 1;
-    }
-    return 0;
-}
-
-UINTN efi_volume_count(void) {
-    UINTN count = 0;
-    EFI_HANDLE *handles = efi_locate_handle_buffer(
-        &gEfiSimpleFileSystemProtocolGuid, &count);
-    if (handles) efi_free_pool(handles);
-    return count;
-}
-
-EFI_FILE_PROTOCOL* efi_open_volume(UINTN index) {
-    UINTN count = 0;
-    EFI_HANDLE *handles = efi_locate_handle_buffer(
-        &gEfiSimpleFileSystemProtocolGuid, &count);
-    if (!handles) return NULL;
-    EFI_FILE_PROTOCOL *root = NULL;
-    if (index < count) {
-        EFI_FILE_IO_INTERFACE *io = NULL;
-        if (!EFI_ERROR(BS->HandleProtocol(handles[index],
-                &gEfiSimpleFileSystemProtocolGuid, (void**)&io))) {
-            if (EFI_ERROR(io->OpenVolume(io, &root))) root = NULL;
-        }
-    }
-    efi_free_pool(handles);
-    return root;
+    UINTN requested = size;
+    EFI_STATUS status = file->handle->Read(file->handle, &size, buf);
+    if (EFI_ERROR(status)) return 0;
+    return size > requested ? requested : size;
 }
 
 int efi_file_exists_root(EFI_FILE_PROTOCOL *root, CHAR16 *path) {
@@ -386,9 +354,22 @@ efi_file_buffer_t* efi_load_file(CHAR16 *path) {
         return NULL;
     }
 
-    buf->size = efi_fread(file, buf->data, (UINTN)size);
+    UINTN total = 0;
+    while (total < (UINTN)size) {
+        UINTN n = efi_fread(file, (UINT8*)buf->data + total, (UINTN)size - total);
+        if (n == 0) break;
+        total += n;
+    }
     efi_fclose(file);
 
+    if (total != (UINTN)size) {
+        efi_log(L"WARN: short file read - skipping incomplete data");
+        efi_free_pool(buf->data);
+        efi_free_pool(buf);
+        return NULL;
+    }
+
+    buf->size = total;
     return buf;
 }
 
@@ -412,17 +393,19 @@ int efi_rename_file(CHAR16 *oldp, CHAR16 *newp) {
                 UINT8 *buf = efi_allocate_pool((UINTN)sz);
                 if (buf) {
                     UINTN rd = (UINTN)sz;
-                    if (!EFI_ERROR(fh->Read(fh, &rd, buf))) {
-                        fh->Delete(fh);
-                        fh = NULL;
+                    if (!EFI_ERROR(fh->Read(fh, &rd, buf)) && rd == (UINTN)sz) {
                         EFI_FILE_PROTOCOL *nf = NULL;
                         if (!EFI_ERROR(root->Open(root, &nf, newp,
                                 EFI_FILE_MODE_CREATE | EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && nf) {
                             UINTN w = rd;
-                            nf->Write(nf, &w, buf);
-                            nf->Flush(nf);
+                            EFI_STATUS ws = nf->Write(nf, &w, buf);
+                            EFI_STATUS fs = nf->Flush(nf);
                             nf->Close(nf);
-                            ok = 1;
+                            if (!EFI_ERROR(ws) && !EFI_ERROR(fs) && w == rd) {
+                                EFI_STATUS ds = fh->Delete(fh);
+                                fh = NULL;
+                                ok = !EFI_ERROR(ds);
+                            }
                         }
                     }
                     efi_free_pool(buf);
@@ -500,8 +483,24 @@ void efi_load_fs_drivers(void) {
 }
 
 int visor_quiet = 0;
+int visor_log_to_console = 0;
+int visor_boot_services_active = 1;
+static int visor_log_to_file = 1;
+
+void efi_log_set_console(int enabled) {
+    visor_log_to_console = enabled ? 1 : 0;
+}
+
+void efi_log_set_file(int enabled) {
+    visor_log_to_file = enabled ? 1 : 0;
+}
+
+int efi_log_file_enabled(void) {
+    return visor_log_to_file;
+}
 
 void efi_print(CHAR16 *msg, ...) {
+    if (!visor_boot_services_active) return;
     if (visor_quiet) return;
     if (msg)
         ST->ConOut->OutputString(ST->ConOut, msg);
@@ -571,14 +570,23 @@ static EFI_FILE_PROTOCOL *log_file_open(void) {
 
 void efi_log(CHAR16 *msg) {
     if (!msg) return;
-
-    EFI_FILE_PROTOCOL *f = log_file_open();
-    if (!f) return;
+    if (!visor_boot_services_active) return;
 
     UINTN cs = log_elapsed_cs();
     CHAR16 pfx[20];
     SPrint(pfx, sizeof(pfx), L"[%4d.%d%d] ",
            (int)(cs / 100), (int)((cs / 10) % 10), (int)(cs % 10));
+
+    if (visor_log_to_console && !visor_quiet && ST && ST->ConOut) {
+        ST->ConOut->OutputString(ST->ConOut, pfx);
+        ST->ConOut->OutputString(ST->ConOut, msg);
+        ST->ConOut->OutputString(ST->ConOut, L"\r\n");
+    }
+
+    if (!visor_log_to_file) return;
+
+    EFI_FILE_PROTOCOL *f = log_file_open();
+    if (!f) return;
 
     UINT8 line[320];
     UINTN n = 0;
@@ -602,7 +610,10 @@ void efi_log_close(void) {
 }
 
 void efi_log_begin(void) {
+    int prev_file_log = visor_log_to_file;
+    visor_log_to_file = 0;
     efi_file_buffer_t *buf = efi_load_file(LOG_PATH);
+    visor_log_to_file = prev_file_log;
     UINT8  *keep = NULL;
     UINTN   keep_len = 0;
 
@@ -653,6 +664,7 @@ void efi_log_begin(void) {
 }
 
 void efi_sleep(UINTN milliseconds) {
+    if (!visor_boot_services_active) return;
     BS->Stall(milliseconds * 1000);
 }
 
@@ -686,46 +698,6 @@ EFI_HANDLE* efi_locate_handle_buffer(EFI_GUID *proto, UINTN *count) {
         return NULL;
     }
     return buffer;
-}
-
-EFI_HANDLE efi_get_device_handle(EFI_DEVICE_PATH *dp) {
-    if (!dp) return NULL;
-    EFI_HANDLE handle = NULL;
-    EFI_DEVICE_PATH *remaining = dp;
-    EFI_STATUS status = BS->LocateDevicePath(
-        &gEfiDevicePathProtocolGuid, &remaining, &handle);
-    if (EFI_ERROR(status)) return NULL;
-    return handle;
-}
-
-void efi_exit_boot_services(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
-    UINTN map_key = 0;
-    UINTN map_size = 0;
-    EFI_MEMORY_DESCRIPTOR *map = NULL;
-    UINTN desc_size;
-    UINT32 desc_version;
-
-    system_table->BootServices->GetMemoryMap(&map_size, NULL, &map_key, &desc_size, &desc_version);
-    map_size += 2 * desc_size;
-    map = (EFI_MEMORY_DESCRIPTOR*)efi_allocate_pool(map_size);
-
-    EFI_STATUS status;
-    do {
-        status = system_table->BootServices->GetMemoryMap(
-            &map_size, map, &map_key, &desc_size, &desc_version);
-        if (EFI_ERROR(status)) {
-            map_size += desc_size;
-            efi_free_pool(map);
-            map = (EFI_MEMORY_DESCRIPTOR*)efi_allocate_pool(map_size);
-        }
-    } while (EFI_ERROR(status));
-
-    status = system_table->BootServices->ExitBootServices(image_handle, map_key);
-    if (!EFI_ERROR(status)) {
-        system_table->BootServices = NULL;
-    }
-
-    efi_free_pool(map);
 }
 
 static EFI_GUID visor_var_guid = { 0xb9d4f5a2, 0x7c3e, 0x4f1a,
