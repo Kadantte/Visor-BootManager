@@ -34,22 +34,3 @@ int visor_hash_ok(boot_entry_t *entry, const void *data, UINTN size) {
     efi_print(L"SECURITY: kernel hash mismatch, refusing to boot\r\n");
     return 0;
 }
-
-int visor_hash_ok_path(boot_entry_t *entry, CHAR16 *path) {
-    if (!entry->has_sha256) return 1;
-    if (!path) {
-        efi_log(L"ERROR: sha256 pin set but no path to verify - refusing to boot");
-        return 0;
-    }
-
-    efi_file_buffer_t *buf = efi_load_file(path);
-    if (!buf) {
-        efi_log(L"ERROR: sha256 pin set but file unreadable - refusing to boot");
-        return 0;
-    }
-
-    int ok = visor_hash_ok(entry, buf->data, buf->size);
-    efi_free_pool(buf->data);
-    efi_free_pool(buf);
-    return ok;
-}
