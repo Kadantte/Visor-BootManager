@@ -1,6 +1,7 @@
 
 #include "config.h"
 #include "efi_helpers.h"
+/* #include "accent.h" */
 #include <efi.h>
 #include <efilib.h>
 
@@ -126,7 +127,11 @@ static void free_deployments(deployment_t *deps, UINTN count) {
 /* 'emilia-chan' */
 static UINTN parse_uint(CHAR16 *s) {
     UINTN n = 0;
-    while (*s >= '0' && *s <= '9') { n = n * 10 + (*s - '0'); s++; }
+    while (*s >= '0' && *s <= '9') {
+        if (n >= 100000000u) n = 100000000u;
+        else n = n * 10 + (UINTN)(*s - '0');
+        s++;
+    }
     return n;
 }
 
@@ -501,6 +506,62 @@ static EFI_FILE_PROTOCOL *root_from_handle(EFI_HANDLE h) {
     return root;
 }
 
+static int equals_ci(CHAR16 *a, const CHAR16 *b) {
+    UINTN i = 0;
+    while (a[i] && b[i] && lc16(a[i]) == lc16((CHAR16)b[i])) i++;
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static int scan_vendor_loaders(config_t *config, EFI_FILE_PROTOCOL *root) {
+    static const CHAR16 *skip_dirs[] = {
+        L"BOOT", L"Microsoft", L"visor", L"Linux", L"systemd",
+        L"refind", L"tools", NULL
+    };
+    static const CHAR16 *loaders[] = { L"shimx64.efi", L"grubx64.efi", NULL };
+
+    EFI_FILE_PROTOCOL *d = efi_open_dir(root, L"\\EFI");
+    if (!d) return 0;
+
+    int added = 0;
+    CHAR16 name[128];
+    int is_dir;
+    while (efi_read_dirent(d, name, 128, &is_dir)) {
+        if (!is_dir) continue;
+        int skip = 0;
+        for (int i = 0; skip_dirs[i]; i++)
+            if (equals_ci(name, skip_dirs[i])) { skip = 1; break; }
+        if (skip) continue;
+
+        for (int i = 0; loaders[i]; i++) {
+            CHAR16 path[MAX_PATH];
+            SPrint(path, sizeof(path), L"\\EFI\\%s\\%s", name, loaders[i]);
+            if (!efi_file_exists_root(root, path)) continue;
+
+            efi_log(L"config: auto-detected distro loader");
+            efi_log(path);
+
+            CHAR16 *entry_name = efi_strdup(name);
+            CHAR16 *entry_icon = distro_icon(name);
+            CHAR16 *entry_path = efi_strdup(path);
+            if (!entry_name || !entry_path) {
+                free_char16(&entry_name);
+                free_char16(&entry_icon);
+                free_char16(&entry_path);
+            } else if (config_add_entry(config, entry_name, entry_icon,
+                                 entry_path, NULL, NULL, NULL, 0, 0, 0)) {
+                added++;
+            } else {
+                free_char16(&entry_name);
+                free_char16(&entry_icon);
+                free_char16(&entry_path);
+            }
+            break;
+        }
+    }
+    d->Close(d);
+    return added;
+}
+
 #define MAX_BLS 48
 
 typedef struct {
@@ -511,10 +572,7 @@ typedef struct {
 static CHAR16* read_text_from_root(EFI_FILE_PROTOCOL *root, CHAR16 *path) {
     EFI_FILE_PROTOCOL *fh = NULL;
     if (EFI_ERROR(root->Open(root, &fh, path, EFI_FILE_MODE_READ, 0)) || !fh) return NULL;
-    UINT64 sz = 0;
-    fh->SetPosition(fh, ~0ULL);
-    fh->GetPosition(fh, &sz);
-    fh->SetPosition(fh, 0);
+    UINT64 sz = efi_file_size(fh);
     if (sz == 0 || sz > 1024 * 1024) { fh->Close(fh); return NULL; }
     UINT8 *raw = efi_allocate_pool((UINTN)sz);
     if (!raw) { fh->Close(fh); return NULL; }
@@ -763,6 +821,10 @@ void bls_decrement(boot_entry_t *e) {
     for (UINTN i = 0; i < n; i++) if (d->bls_path[i] == '+') plus = (INTN)i;
     if (plus < 0) return;
 
+    if ((UINTN)plus + 32 >= MAX_PATH) {
+        efi_log(L"WARN: bls path too long to update boot-counter");
+        return;
+    }
     CHAR16 base[MAX_PATH];
     UINTN k = 0;
     for (INTN i = 0; i < plus && k < MAX_PATH - 1; i++) base[k++] = d->bls_path[i];
@@ -832,12 +894,22 @@ static EFI_STATUS detect_entries(config_t *config) {
     }
 
     if (!uki_found && !bls) {
+        int raw_found = 0;
         for (UINTN v = 0; v < nvol; v++) {
             EFI_FILE_PROTOCOL *root = root_from_handle(vols[v]);
             if (!root) continue;
-            scan_kernel_dir(config, root, L"\\boot");
-            scan_kernel_dir(config, root, L"\\");
+            raw_found += scan_kernel_dir(config, root, L"\\boot");
+            raw_found += scan_kernel_dir(config, root, L"\\");
             root->Close(root);
+        }
+        { CHAR16 d[64]; SPrint(d, sizeof(d), L"config: raw kernel scan found %d", raw_found); efi_log(d); }
+        if (!raw_found) {
+            for (UINTN v = 0; v < nvol; v++) {
+                EFI_FILE_PROTOCOL *root = root_from_handle(vols[v]);
+                if (!root) continue;
+                scan_vendor_loaders(config, root);
+                root->Close(root);
+            }
         }
     }
 
@@ -851,10 +923,7 @@ static CHAR16* read_text_file(CHAR16 *path) {
     efi_file_t *file = efi_fopen(path);
     if (!file) return NULL;
 
-    UINT64 size = 0;
-    file->handle->SetPosition(file->handle, ~0ULL);
-    file->handle->GetPosition(file->handle, &size);
-    file->handle->SetPosition(file->handle, 0);
+    UINT64 size = efi_file_size(file->handle);
 
     if (size > CONFIG_TEXT_MAX) {
         efi_log(L"WARN: config text file exceeds 1 MiB - ignoring");
@@ -911,22 +980,15 @@ static CHAR16* read_text_file(CHAR16 *path) {
 
 static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
     if (efi_strcmp(key, L"timeout") == 0) {
-        INTN sign = 1;
-        if (*value == '-') { sign = -1; value++; }
-        INTN t = 0;
-        while (*value >= '0' && *value <= '9') { t = t * 10 + (*value - '0'); value++; }
-        config->timeout = (sign < 0) ? -1 : t;
+        config->timeout = (*value == '-') ? -1 : (INTN)parse_uint(value);
     } else if (efi_strcmp(key, L"default") == 0) {
-        config->default_entry = 0;
-        while (*value >= '0' && *value <= '9') {
-            config->default_entry = config->default_entry * 10 + (*value - '0');
-            value++;
-        }
+        config->default_entry = (INTN)parse_uint(value);
     } else if (efi_strcmp(key, L"quiet") == 0) {
         config->quiet = (*value == '1' || *value == 't' || *value == 'y');
     } else if (efi_strcmp(key, L"text_menu") == 0 || efi_strcmp(key, L"text_mode") == 0) {
         config->text_menu = (*value == '1' || *value == 't' || *value == 'y');
     } else if (efi_strcmp(key, L"cmdline") == 0 || efi_strcmp(key, L"options") == 0) {
+        if (config->def_cmdline) efi_free_pool(config->def_cmdline);
         config->def_cmdline = (value[0] == '\0') ? NULL : efi_strdup(value);
     } else if (efi_strcmp(key, L"show_names") == 0 || efi_strcmp(key, L"names") == 0) {
         config->show_names = (*value == '1' || *value == 't' || *value == 'y');
@@ -960,8 +1022,10 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
             else efi_log(L"WARN: invalid resolution (use WxH, e.g. 1920x1080, or max/native)");
         }
     } else if (efi_strcmp(key, L"theme") == 0) {
+        if (config->theme) efi_free_pool(config->theme);
         config->theme = (value[0] == '\0') ? NULL : efi_strdup(value);
     } else if (efi_strcmp(key, L"title") == 0) {
+        if (config->title) efi_free_pool(config->title);
         if (efi_strcmp(value, L"none") == 0) {
             config->no_title = 1;
             config->title = NULL;
@@ -973,6 +1037,7 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
             config->title = efi_strdup(value);
         }
     } else if (efi_strcmp(key, L"font") == 0) {
+        if (config->font) efi_free_pool(config->font);
         config->font = (value[0] == '\0') ? NULL : efi_strdup(value);
     } else if (efi_strcmp(key, L"title_color") == 0) {
         if (!parse_color(value, &config->title_color))
@@ -1029,16 +1094,20 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
         else
             efi_log(L"WARN: invalid firmware_color (use #RRGGBB)");
     } else if (efi_strcmp(key, L"background") == 0) {
+        if (config->background) efi_free_pool(config->background);
         config->background = dup_path(value);
     } else if (efi_strcmp(key, L"power_icons") == 0) {
         config->power_icons = (*value == '1' || *value == 't' || *value == 'y');
     } else if (efi_strcmp(key, L"power_icon_size") == 0) {
         config->power_icon_size = parse_uint(value);
     } else if (efi_strcmp(key, L"shutdown_icon") == 0) {
+        if (config->shutdown_icon) efi_free_pool(config->shutdown_icon);
         config->shutdown_icon = dup_path(value);
     } else if (efi_strcmp(key, L"reboot_icon") == 0) {
+        if (config->reboot_icon) efi_free_pool(config->reboot_icon);
         config->reboot_icon = dup_path(value);
     } else if (efi_strcmp(key, L"firmware_icon") == 0) {
+        if (config->firmware_icon) efi_free_pool(config->firmware_icon);
         config->firmware_icon = dup_path(value);
     } else if (efi_strcmp(key, L"blur") == 0) {
         if (*value == 'c' || *value == 'C') config->blur = 2;
@@ -1058,6 +1127,18 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
             config->has_blur_color = 1;
         else
             efi_log(L"WARN: invalid blur_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"accent") == 0) {
+        config->accent_enabled = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"accent_icons") == 0) {
+        config->accent_icons = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"accent_underline") == 0) {
+        config->accent_underline = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"accent_text") == 0) {
+        config->accent_text = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"accent_os_icons") == 0) {
+        config->accent_os_icons = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"accent_variant") == 0) {
+        config->accent_variant = accent_variant_from_str(value);
     }
 }
 
@@ -1258,6 +1339,12 @@ EFI_STATUS config_parse(config_t *config) {
     config->blur_title = 0;
     config->blur_color = COLOR_WHITE;
     config->has_blur_color = 0;
+    config->accent_enabled = 0;
+    config->accent_icons = 1;
+    config->accent_underline = 1;
+    config->accent_text = 0;
+    config->accent_os_icons = 0;
+    config->accent_variant = ACCENT_TONAL;
     config->animation = 1;
     config->anim_speed = 0;
     config->fade_speed = 0;
@@ -1292,6 +1379,8 @@ EFI_STATUS config_parse(config_t *config) {
         lines[line_count++] = start;
         start = end + 1;
     }
+    if (*start)
+        efi_log(L"WARN: config exceeds 256 lines - remainder ignored");
 
     UINTN entry_count_before_parse = config->entry_count;
 
@@ -1413,6 +1502,9 @@ void config_free(config_t *config) {
         if (entry->name) efi_free_pool(entry->name);
         if (entry->icon_path) efi_free_pool(entry->icon_path);
         if (entry->deployments) {
+            int cmdline_aliased = 0;
+            for (UINTN i = 0; i < entry->deploy_count; i++)
+                if (entry->cmdline == entry->deployments[i].cmdline) cmdline_aliased = 1;
             for (UINTN i = 0; i < entry->deploy_count; i++) {
                 deployment_t *d = &entry->deployments[i];
                 if (d->version)  efi_free_pool(d->version);
@@ -1421,6 +1513,7 @@ void config_free(config_t *config) {
                 if (d->cmdline)  efi_free_pool(d->cmdline);
                 if (d->bls_path) efi_free_pool(d->bls_path);
             }
+            if (!cmdline_aliased && entry->cmdline) efi_free_pool(entry->cmdline);
             efi_free_pool(entry->deployments);
         } else {
             if (entry->kernel_path) efi_free_pool(entry->kernel_path);
