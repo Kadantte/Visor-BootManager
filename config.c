@@ -1,7 +1,7 @@
 
 #include "config.h"
 #include "efi_helpers.h"
-/* #include "accent.h" */
+#include "accent.h"
 #include <efi.h>
 #include <efilib.h>
 
