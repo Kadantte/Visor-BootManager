@@ -1,7 +1,7 @@
 
 #include "config.h"
 #include "efi_helpers.h"
-#include "accent.h"
+/* #include "accent.h" */  /* accent disabled for this build */
 #include <efi.h>
 #include <efilib.h>
 
@@ -1127,6 +1127,7 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
             config->has_blur_color = 1;
         else
             efi_log(L"WARN: invalid blur_color (use #RRGGBB)");
+    /* accent disabled for this build
     } else if (efi_strcmp(key, L"accent") == 0) {
         config->accent_enabled = (*value == '1' || *value == 't' || *value == 'y');
     } else if (efi_strcmp(key, L"accent_icons") == 0) {
@@ -1139,6 +1140,7 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
         config->accent_os_icons = (*value == '1' || *value == 't' || *value == 'y');
     } else if (efi_strcmp(key, L"accent_variant") == 0) {
         config->accent_variant = accent_variant_from_str(value);
+    */
     }
 }
 
@@ -1339,12 +1341,14 @@ EFI_STATUS config_parse(config_t *config) {
     config->blur_title = 0;
     config->blur_color = COLOR_WHITE;
     config->has_blur_color = 0;
+    /* accent disabled for this build
     config->accent_enabled = 0;
     config->accent_icons = 1;
     config->accent_underline = 1;
     config->accent_text = 0;
     config->accent_os_icons = 0;
     config->accent_variant = ACCENT_TONAL;
+    */
     config->animation = 1;
     config->anim_speed = 0;
     config->fade_speed = 0;
