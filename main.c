@@ -118,12 +118,14 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
     gui.blur            = config.blur;
     gui.blur_title      = config.blur_title;
     gui.blur_color      = config.has_blur_color ? config.blur_color : COLOR_WHITE;
+    /* accent disabled for this build
     gui.accent_enabled   = config.accent_enabled;
     gui.accent_icons     = config.accent_icons;
     gui.accent_underline = config.accent_underline;
     gui.accent_text      = config.accent_text;
     gui.accent_os_icons  = config.accent_os_icons;
     gui.accent_variant   = config.accent_variant;
+    */
     gui.animation       = config.animation;
     gui.anim_speed      = config.anim_speed;
     gui.fade_speed      = config.fade_speed;
