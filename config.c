@@ -383,6 +383,10 @@ static int is_loader_efi(CHAR16 *name) {
     return 0;
 }
 
+static CHAR16* dir_prefix(CHAR16 *dir) {
+    return (dir[0] == '\\' && dir[1] == '\0') ? L"" : dir;
+}
+
 static int scan_uki_dir(config_t *config, EFI_FILE_PROTOCOL *root, CHAR16 *dir) {
     EFI_FILE_PROTOCOL *d = efi_open_dir(root, dir);
     if (!d) return 0;
@@ -396,7 +400,7 @@ static int scan_uki_dir(config_t *config, EFI_FILE_PROTOCOL *root, CHAR16 *dir) 
         if (is_loader_efi(name)) continue;
 
         CHAR16 path[MAX_PATH];
-        SPrint(path, sizeof(path), L"%s\\%s", dir, name);
+        SPrint(path, sizeof(path), L"%s\\%s", dir_prefix(dir), name);
 
         CHAR16 disp[128];
         UINTN n = 0;
@@ -450,7 +454,7 @@ static CHAR16* find_initrd(EFI_FILE_PROTOCOL *root, CHAR16 *dir, CHAR16 *kernel_
     };
     for (int p = 0; patterns[p]; p++) {
         CHAR16 cand[MAX_PATH];
-        SPrint(cand, sizeof(cand), patterns[p], dir, sbuf);
+        SPrint(cand, sizeof(cand), patterns[p], dir_prefix(dir), sbuf);
         if (efi_file_exists_root(root, cand)) return efi_strdup(cand);
     }
     return NULL;
@@ -468,7 +472,7 @@ static int scan_kernel_dir(config_t *config, EFI_FILE_PROTOCOL *root, CHAR16 *di
         if (!is_kernel_name(name)) continue;
 
         CHAR16 path[MAX_PATH];
-        SPrint(path, sizeof(path), L"%s\\%s", dir, name);
+        SPrint(path, sizeof(path), L"%s\\%s", dir_prefix(dir), name);
         CHAR16 *initrd = find_initrd(root, dir, name);
 
         efi_log(L"config: auto-detected raw kernel");
