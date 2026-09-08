@@ -74,15 +74,18 @@ default=0
 
 # NVRAM Boot-entry policy.
 #   off    - never touch NVRAM variables.
-#   ensure - recreate a missing Visor Boot#### entry; if it has been removed
-#            from BootOrder, append it back at the tail.
-#   first  (default) - same as ensure, plus: when BootCurrent matches the
+#   ensure (default) - recreate a missing Visor Boot#### entry; if it has been
+#            removed from BootOrder, append it back at the tail.
+#   first  - same as ensure, plus: when BootCurrent matches the
 #            Visor entry (a normal boot through the firmware boot manager),
 #            keep Visor first in BootOrder.  Only rearranges an existing
 #            order - never invents one.
+# To protect NVRAM from firmware/OS reorder wars, any BootOrder rewrite arms
+# a short cooldown: further rewrites are skipped for the next few boot periods
+# (counted with a small stamp file on the ESP, not in NVRAM).
 # (alias: boot_order)
-#boot_order=first
-#selfheal_order=first
+#boot_order=ensure
+#selfheal_order=ensure
 
 # Re-copy the running Visor binary to the default fallback path at startup.
 # Windows feature updates and 24H2 may replace \EFI\BOOT\BOOTx64.EFI with

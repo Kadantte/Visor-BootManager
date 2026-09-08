@@ -244,6 +244,67 @@ static void nvsh_strcpy_safe(CHAR16 *dst, UINTN cap, const CHAR16 *src) {
     dst[i] = 0;
 }
 
+static void nvsh_stamp_path(const CHAR16 *run, CHAR16 *out, UINTN cap) {
+    if (!run || !out || cap < 16) return;
+    UINTN i = 0, slash = 0;
+    while (run[i]) {
+        if (run[i] == L'\\') slash = i;
+        i++;
+    }
+    UINTN plen = (slash || !i) ? slash + 1 : i;
+    UINTN n = 0;
+    for (UINTN k = 0; k < plen && n + 1 < cap; k++) out[n++] = run[k];
+    static const CHAR16 name[] = L".selfheal";
+    for (UINTN k = 0; name[k] && n + 1 < cap; k++) out[n++] = name[k];
+    out[n] = 0;
+}
+
+static int nvsh_stamp_read(const CHAR16 *path) {
+    EFI_FILE_PROTOCOL *root = efi_boot_volume_root();
+    if (!root) return 0;
+    EFI_FILE_PROTOCOL *f = NULL;
+    EFI_STATUS s = root->Open(root, &f, (CHAR16 *)path, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(s) || !f) {
+        if (f) f->Close(f);
+        root->Close(root);
+        return 0;
+    }
+    UINT8 buf[16];
+    UINTN got = sizeof(buf);
+    EFI_STATUS rs = f->Read(f, &got, buf);
+    f->Close(f);
+    root->Close(root);
+    if (EFI_ERROR(rs)) return 0;
+    int v = 0;
+    for (UINTN i = 0; i < got; i++) {
+        if (buf[i] < L'0' || buf[i] > L'9') break;
+        v = v * 10 + (buf[i] - L'0');
+    }
+    return v;
+}
+
+static void nvsh_stamp_write(const CHAR16 *path, int val) {
+    EFI_FILE_PROTOCOL *root = efi_boot_volume_root();
+    if (!root) return;
+    EFI_FILE_PROTOCOL *f = NULL;
+    EFI_STATUS s = root->Open(root, &f, (CHAR16 *)path,
+                              EFI_FILE_MODE_CREATE | EFI_FILE_MODE_READ |
+                                  EFI_FILE_MODE_WRITE,
+                              0);
+    if (EFI_ERROR(s) || !f) {
+        if (f) f->Close(f);
+        root->Close(root);
+        return;
+    }
+    CHAR16 txt[8];
+    UINTN n = SPrint(txt, sizeof(txt), L"%d", val);
+    UINTN sz = n * sizeof(CHAR16);
+    EFI_STATUS ws = f->Write(f, &sz, txt);
+    if (!EFI_ERROR(ws)) ws = f->Flush(f);
+    f->Close(f);
+    root->Close(root);
+}
+
 /* Runs the full NVRAM pass; reports into rep. */
 static void nvsh_nvram_pass(const CHAR16 *run, int mode, int dry_run,
                             nvsh_report_t *rep) {
@@ -426,32 +487,54 @@ static void nvsh_nvram_pass(const CHAR16 *run, int mode, int dry_run,
     if (changed < 0) {
         nsh_log(L"selfheal: invalid boot-order mode (%d)", mode);
     } else if (changed) {
-        rep->order_updated = 1;
-        nsh_log(L"selfheal: BootOrder needs %s (entry Boot%04X)",
-                rep->normal_boot ? L"promotion to head" : L"re-add",
-                (unsigned)slot);
+        int suppress = 0;
         if (!dry_run) {
-            UINT8 ob[(NVSH_SLOTS + 2) * 2];
-            UINTN k = 0;
-            for (UINTN i = 0; i < nn; i++) {
-                ob[k] = (UINT8)list[i];
-                ob[k + 1] = (UINT8)(list[i] >> 8);
-                k += 2;
+            CHAR16 sp[180];
+            nvsh_stamp_path(run, sp, 180);
+            int rem = nvsh_stamp_read(sp);
+            if (rem > 0) {
+                suppress = 1;
+                nsh_log(L"selfheal: BootOrder rewrite deferred by %d-boot cooldown",
+                        rem);
+                nvsh_stamp_write(sp, rem - 1);
             }
-            EFI_STATUS ws = RT->SetVariable(
-                L"BootOrder", &gEfiGlobalVariableGuid,
-                EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
-                    EFI_VARIABLE_RUNTIME_ACCESS,
-                k, ob);
-            if (EFI_ERROR(ws)) {
-                rep->error = (ws == EFI_ACCESS_DENIED) ? NVSH_ERR_ORDER_LOCKED
-                                                       : NVSH_ERR_BOOTMGR;
-                nsh_log(L"selfheal: SetVariable BootOrder failed (%d)", (int)ws);
-            } else {
-                nsh_log(L"selfheal: BootOrder rewritten (%d entries)", (int)nn);
-            }
+        }
+        if (suppress) {
+            rep->order_suppressed = 1;
         } else {
-            nsh_log(L"selfheal: dry run - BootOrder not written");
+            rep->order_updated = 1;
+            nsh_log(L"selfheal: BootOrder needs %s (entry Boot%04X)",
+                    rep->normal_boot ? L"promotion to head" : L"re-add",
+                    (unsigned)slot);
+            if (!dry_run) {
+                UINT8 ob[(NVSH_SLOTS + 2) * 2];
+                UINTN k = 0;
+                for (UINTN i = 0; i < nn; i++) {
+                    ob[k] = (UINT8)list[i];
+                    ob[k + 1] = (UINT8)(list[i] >> 8);
+                    k += 2;
+                }
+                EFI_STATUS ws = RT->SetVariable(
+                    L"BootOrder", &gEfiGlobalVariableGuid,
+                    EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                        EFI_VARIABLE_RUNTIME_ACCESS,
+                    k, ob);
+                if (EFI_ERROR(ws)) {
+                    rep->error = (ws == EFI_ACCESS_DENIED) ? NVSH_ERR_ORDER_LOCKED
+                                                           : NVSH_ERR_BOOTMGR;
+                    rep->order_updated = 0;
+                    nsh_log(L"selfheal: SetVariable BootOrder failed (%d)", (int)ws);
+                } else {
+                    CHAR16 sp[180];
+                    nvsh_stamp_path(run, sp, 180);
+                    nvsh_stamp_write(sp, NVSH_COOLDOWN_BOOTS);
+                    nsh_log(L"selfheal: BootOrder rewritten (%d entries), "
+                            L"%d-boot cooldown armed",
+                            (int)nn, NVSH_COOLDOWN_BOOTS);
+                }
+            } else {
+                nsh_log(L"selfheal: dry run - BootOrder not written");
+            }
         }
     } else {
         nsh_log(n ? L"selfheal: BootOrder fine, no change" : L"selfheal: BootOrder empty");
@@ -625,7 +708,7 @@ nvsh_report_t nvram_self_heal(nvsh_policy_t *policy) {
 
 void nvsh_policy_defaults(nvsh_policy_t *policy) {
     if (!policy) return;
-    policy->order_mode = NVSH_ORDER_FIRST;
+    policy->order_mode = NVSH_ORDER_ENSURE;
     policy->restore_fallback = 1;
     policy->dry_run = 0;
 }

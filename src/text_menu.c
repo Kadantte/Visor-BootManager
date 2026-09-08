@@ -1387,9 +1387,9 @@ static int execute_recovery_command(gui_state_t *state, boot_entry_t **selected_
                rep.entry_present, rep.entry_in_order, rep.entry_created);
         out_line(row, rows, cols, VT_NORMAL, line);
         SPrint(line, sizeof(line),
-               L"selfheal: normal_boot=%d order_missing=%d order_updated=%d removable=%d err=%s",
+               L"selfheal: normal_boot=%d order_missing=%d order_updated=%d order_cooldown=%d removable=%d err=%s",
                rep.normal_boot, rep.order_missing, rep.order_updated,
-               rep.removable, nvsh_err_text(rep.error));
+               rep.order_suppressed, rep.removable, nvsh_err_text(rep.error));
         out_line(row, rows, cols, VT_NORMAL, line);
         SPrint(line, sizeof(line),
                L"selfheal: fallback_restored=%d fallback_unneeded=%d image=%s",

@@ -809,14 +809,14 @@
       "x-aliases": [
         "boot_order"
       ],
-      "description": "Repair policy for the NVRAM Boot entry and BootOrder list. 'first' (default) ensures Visor is listed first in BootOrder when a normal boot-manager boot is detected; 'ensure' only recreates a missing entry without moving it; 'off' leaves the NVRAM untouched.",
+      "description": "Repair policy for the NVRAM Boot entry and BootOrder list. 'ensure' (default) recreates a missing entry and appends it to BootOrder; 'first' additionally keeps Visor at the head of BootOrder on a normal boot-manager boot; 'off' leaves the NVRAM untouched. Any BootOrder rewrite arms a short cooldown (a few boot periods, tracked via an ESP stamp file) so firmware/OS reorder wars cannot wear out NVRAM.",
       "type": "string",
       "enum": [
         "off",
         "ensure",
         "first"
       ],
-      "default": "first"
+      "default": "ensure"
     },
     "resolution": {
       "x-group": "appearance",

@@ -3637,7 +3637,7 @@ EFI_STATUS config_parse(config_t *config) {
     config->box_radius = 0;
     config->remember_last = 0;
     config->selfheal = 1;
-    config->selfheal_order = NVSH_ORDER_FIRST;
+    config->selfheal_order = NVSH_ORDER_ENSURE;
     config->restore_fallback = 1;
     config->recovery_entries = 0;
     config->snapshots_mode = 1;

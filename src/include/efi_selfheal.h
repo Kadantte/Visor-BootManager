@@ -25,6 +25,8 @@
 #define NVSH_ERR_ENTRY_LOCKED  6
 #define NVSH_ERR_NOSLOT        7
 
+#define NVSH_COOLDOWN_BOOTS    4
+
 typedef struct {
     int order_mode;
     int restore_fallback;
@@ -39,6 +41,7 @@ typedef struct {
     int    order_updated;
     int    normal_boot;
     int    removable;
+    int    order_suppressed;
     int    fallback_restored;
     int    fallback_unneeded;
     UINT16 our_entry;
