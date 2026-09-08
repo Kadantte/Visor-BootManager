@@ -261,12 +261,32 @@ resolve_esp() {
     detect_esp
 }
 
+# Print lines of valid (correctly-numbered, 4-digit Boot####) Visor entries.
+# Exit 0 if at least one valid entry is present.
+valid_visor_entries() {
+    efibootmgr 2>/dev/null | awk '
+        /^[Bb]oot[0-9A-Fa-f]{4}[^0-9A-Fa-f]/ && /[Vv]isor/ { print; found=1 }
+        END { exit !found }
+    '
+}
+
+# Print lines of corrupted (malformed, non-4-digit Boot####) Visor entries.
+corrupted_visor_entries() {
+    efibootmgr 2>/dev/null | awk '
+        /^[Bb]oot[0-9A-Fa-f]{5,}[^0-9A-Fa-f]/ && /[Vv]isor/ { print }
+    '
+}
+
 ensure_visor_boot_entry() {
     local esp="$1"
     command -v efibootmgr >/dev/null 2>&1 || { warn "efibootmgr not installed; skipping boot entry."; return 0; }
-    if efibootmgr 2>/dev/null | grep -q 'Visor'; then
+    if valid_visor_entries >/dev/null; then
         say "UEFI boot entry 'Visor' already exists; left untouched."
         return 0
+    fi
+    if corrupted_visor_entries >/dev/null; then
+        warn "Malformed UEFI boot entry 'Visor' detected; creating a fresh valid one."
+        warn "Old unusable entries may need manual cleanup (see '#32')."
     fi
     local src disk partnum
     src="$(findmnt -Uno SOURCE "$esp")" || { warn "Cannot resolve ESP device; skipping boot entry."; return 0; }
@@ -789,8 +809,10 @@ EOF
     fi
 
     if command -v efibootmgr >/dev/null 2>&1; then
-        if efibootmgr 2>/dev/null | grep -qi 'Visor'; then
+        if valid_visor_entries >/dev/null; then
             printf 'ok  UEFI boot entry\n'
+        elif corrupted_visor_entries >/dev/null; then
+            printf 'warn UEFI boot entry corrupted (run `visor update --boot-entry` to fix)\n'
         else
             printf 'warn UEFI boot entry missing\n'
         fi
@@ -1032,8 +1054,10 @@ cmd_status() {
         [ -f "$root/boot.conf" ] && printf 'Config: %s\n' "$root/boot.conf" || printf 'Config: missing\n'
         [ -f "$root/boot.log" ] && printf 'Boot log: %s\n' "$root/boot.log" || printf 'Boot log: missing\n'
         if command -v efibootmgr >/dev/null 2>&1; then
-            if efibootmgr 2>/dev/null | grep -qi 'Visor'; then
+            if valid_visor_entries >/dev/null; then
                 printf 'UEFI entry: present\n'
+            elif corrupted_visor_entries >/dev/null; then
+                printf 'UEFI entry: present (corrupted — run `visor update --boot-entry` to fix)\n'
             elif efibootmgr >/dev/null 2>&1; then
                 printf 'UEFI entry: missing\n'
             else
@@ -1244,12 +1268,14 @@ remove_boot_entry() {
     fi
 
     local line num
-    line="$(efibootmgr -v 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^Boot[0-9A-F]{4}\*/ && /Visor/ {print; exit}')"
-    [ -n "$line" ] || return 0
-    num="$(printf '%s\n' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')"
-    [ -n "$num" ] || return 0
-    say "Removing UEFI boot entry Boot${num}"
-    run_root efibootmgr -b "$num" -B
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        num="$(printf '%s\n' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4,\}\).*/\1/p')"
+        [ -n "$num" ] || continue
+        say "Removing UEFI boot entry Boot${num}"
+        run_root efibootmgr -b "$num" -B
+    done < <(efibootmgr -v 2>/dev/null | \
+        awk 'BEGIN{IGNORECASE=1} /^Boot[0-9A-Fa-f]{4,}[^0-9A-Fa-f]/ && /Visor/ {print}')
 }
 
 cmd_uninstall() {

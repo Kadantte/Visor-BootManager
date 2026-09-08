@@ -82,6 +82,22 @@ on_err() {
 }
 trap 'on_err $LINENO' ERR
 
+# Print lines of valid (correctly-numbered, 4-digit Boot####) Visor entries.
+# Exit 0 if at least one valid entry is present.
+valid_visor_entries() {
+    efibootmgr 2>/dev/null | awk '
+        /^[Bb]oot[0-9A-Fa-f]{4}[^0-9A-Fa-f]/ && /[Vv]isor/ { print; found=1 }
+        END { exit !found }
+    '
+}
+
+# Print lines of corrupted (malformed, non-4-digit Boot####) Visor entries.
+corrupted_visor_entries() {
+    efibootmgr 2>/dev/null | awk '
+        /^[Bb]oot[0-9A-Fa-f]{5,}[^0-9A-Fa-f]/ && /[Vv]isor/ { print }
+    '
+}
+
 banner() {
     printf '\n%s' "$C_LOGO"
     if [ "$UNICODE" -eq 1 ]; then
@@ -151,8 +167,7 @@ EOF
     exit 0
 }
 
-ask() {
-    local prompt="$1" reply
+ask() {    local prompt="$1" reply
     if [ -t 0 ]; then
         printf '  %s%s%s %s [y/n] ' "$C_ASK" "$S_ASK" "$C_OFF" "$prompt" >&2
         read -r reply || true
@@ -561,10 +576,14 @@ if [ "$DO_BOOT_ENTRY" -eq 1 ]; then
             warn "Could not determine ESP partition number; skipping boot entry."
         elif [ ! -b "$disk" ]; then
             warn "Could not determine ESP disk (got '$disk'); skipping boot entry."
-        elif efibootmgr | grep -q 'Visor'; then
+        elif valid_visor_entries >/dev/null; then
             ok "Boot entry 'Visor' already exists; left untouched."
             BOOT_ENTRY_STATE="already present"
         else
+            if corrupted_visor_entries >/dev/null; then
+                warn "Malformed UEFI boot entry 'Visor' detected; creating a fresh valid one."
+                warn "Old unusable entries may need manual cleanup (see '#32')."
+            fi
             loader="\\${VISOR_DIR_REL//\//\\}\\$EFI_NAME"
             efibootmgr --create --disk "$disk" --part "$partnum" \
                        --label "Visor" --loader "$loader" >/dev/null
