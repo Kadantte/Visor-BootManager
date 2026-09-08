@@ -82,6 +82,7 @@ default=0
 #            order - never invents one.
 # (alias: boot_order)
 #boot_order=first
+#selfheal_order=first
 
 # Re-copy the running Visor binary to the default fallback path at startup.
 # Windows feature updates and 24H2 may replace \EFI\BOOT\BOOTx64.EFI with
@@ -533,6 +534,15 @@ background=\EFI\visor\backgrounds\default.png
 #measure=1
 #tpm_pcr_config=5
 #tpm_pcr_cmdline=12
+
+# --- Sound -------------------------------------------------------------------
+# Visor can play a .wav at startup while the menu initialises. The sound is
+# upsampled and played once through the built-in HDA controller; sounds longer
+# than 4 seconds are truncated at 4.
+#   menu_sound       = path       .wav played once at startup (on by default,
+#                                 but only plays when a path is set;
+#                                 off / 0 / n / f = silent)
+#menu_sound=\EFI\visor\bootsound.wav
 
 # --- Boot Loader Interface (systemd) -----------------------------------------
 # Visor can export and honor the systemd Boot Loader Interface EFI variables so

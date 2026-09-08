@@ -27,8 +27,15 @@ VBG is a keyframe + tiled-quantized-delta container with motion compensation:
 
 Knobs: --threshold is a per-channel dead zone, --qshift sets the residual
 quantizer (Q = 1 << qshift), --mv-range bounds the motion search (0 off).
---denoise runs a temporal filter first; per-pixel grain otherwise dirties
-every tile and collapses the stream back to keyframes.
+--denoise filters the source first; per-pixel grain otherwise dirties every
+tile and collapses the stream back to keyframes.
+
+Grain is the denoiser's job, not the dead zone's: the dead zone cannot tell
+grain from a low-contrast object drifting slowly, so raising it to cover grain
+makes such an object stop moving altogether.  Leaning on spatial denoising
+instead keeps the motion and still compresses -- on a grainy 90-frame clip,
+threshold=12 with the default filter measured 2646 KB against 71 KB, with the
+slow and low-contrast objects tracking cleanly in both.
 
 Usage: vbg_encode.py INPUT OUTPUT [--scale WxH|H] [--quality N]
                      [--threshold T] [--qshift S] [--tile N] [--keyint N]
@@ -319,6 +326,15 @@ REFINE = 1
 MIN_COARSE_TILE = 2
 MV_TILE_COST = 4
 
+# The dead zone discards any per-channel delta at or below it, so it also
+# discards real motion whose per-frame edge change is that small: a
+# low-contrast object drifting a couple of px/frame stops moving entirely
+# somewhere above 16, and it costs nothing in size to keep it (measured 25 KB
+# either way on a 90-frame clip).  Grain belongs to --denoise, which removes it
+# without touching signal; raising the dead zone to cover grain trades away the
+# motion that made the wallpaper worth playing.
+AUTO_THRESH_MAX = 12
+
 def motion_search(cur, prev, tlog, mv_range):
     """Per-tile integer motion search, hierarchical and vectorized over tiles.
 
@@ -575,7 +591,7 @@ def main():
     tile = 16
     keyint = 60
     mv_range = 8
-    denoise = "hqdn3d=4:3:6:4"
+    denoise = "hqdn3d=16:12:6:4"
     progress = 0
     auto_tune = True
     fps = None
@@ -677,8 +693,9 @@ def main():
                 sys.stderr.write("vbg_encode: decoded no frames from %s\n" % src)
                 sys.exit(1)
             floor = float(np.percentile(np.abs(s0 - r0), 99.0))
-            thresh = int(min(48, max(8, round(floor * 2.0))))
-            qshift = 5 if thresh >= 32 else (4 if thresh >= 16 else 3)
+
+            thresh = int(min(AUTO_THRESH_MAX, max(8, round(floor * 1.5))))
+            qshift = 3
             sys.stdout.write(
                 "vbg: keyframe noise floor p99=%.1f -> threshold=%d qshift=%d "
                 "(override with --threshold/--qshift)\n"

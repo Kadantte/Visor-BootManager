@@ -10,6 +10,7 @@
 #include "tcg2.h"
 #include "loader_iface.h"
 #include "efi_selfheal.h"
+#include "rbd.h"
 
 EFI_HANDLE IH;
 
@@ -317,6 +318,15 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
         gui.selected = config.default_entry;
     }
 
+    if (!text_mode) {
+        int rbd_played = rbd_check_and_play(&gui);
+        if (!rbd_played &&
+            menu_sound_prepare(config.menu_sound_on, config.menu_sound)) {
+            gui.sound_start = menu_sound_start;
+            gui.sound_poll  = menu_sound_poll;
+        }
+    }
+
     gui.editor_enabled = config.editor;
     gui.mouse_enabled  = config.mouse;
     gui.pointer_speed  = config.pointer_speed;
@@ -375,6 +385,7 @@ select_entry:
             for (UINTN i = 0; i < pick && selected; i++) selected = selected->next;
             autobooted = 1;
             efi_log(L"main: autoboot - skipping menu, booting directly");
+            menu_sound_finish();
         } else {
             efi_log(L"main: autoboot armed but a key was pressed - showing menu");
         }
@@ -403,6 +414,7 @@ select_entry:
         selected = (text_mode || gui_closed) ? text_menu_run(&gui) : gui_run(&gui);
         action = gui.action;
         force_menu = 0;
+        menu_sound_stop();
         efi_log(L"main: menu closed");
     }
     retry_selected = 0;
@@ -447,6 +459,7 @@ select_entry:
             gui_shutdown(&gui);
         }
         efi_log(L"action: reboot requested - Return by Death");
+        rbd_arm_on_reboot(1);
         RT->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
         return EFI_SUCCESS;
     }

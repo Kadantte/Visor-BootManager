@@ -2787,6 +2787,15 @@ static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
         if (s < 1)  s = 1;
         if (s > 12) s = 12;
         config->record_seconds = s;
+    } else if (efi_strcmp(key, L"menu_sound") == 0) {
+        if (*value == '0' || *value == 'n' || *value == 'f' ||
+            efi_strcmp(value, L"off") == 0) {
+            config->menu_sound_on = 0;
+        } else {
+            config->menu_sound_on = 1;
+            if (config->menu_sound) efi_free_pool(config->menu_sound);
+            config->menu_sound = dup_path(value);
+        }
     } else if (efi_strcmp(key, L"tpm") == 0 ||
                efi_strcmp(key, L"measure") == 0) {
         config->tpm = (*value == '1' || *value == 't' || *value == 'y');
@@ -3716,6 +3725,8 @@ EFI_STATUS config_parse(config_t *config) {
     config->screensaver_blank = 600;
     config->screensaver_clock = 1;
     config->record_seconds = 3;
+    config->menu_sound_on = 1;
+    config->menu_sound = NULL;
     config->tpm = 1;
     config->tpm_pcr_config = TPM_PCR_CONFIG_DEFAULT;
     config->tpm_pcr_cmdline = TPM_PCR_CMDLINE_DEFAULT;
@@ -3926,6 +3937,7 @@ void config_free(config_t *config) {
     if (config->shutdown_icon) efi_free_pool(config->shutdown_icon);
     if (config->reboot_icon)   efi_free_pool(config->reboot_icon);
     if (config->firmware_icon) efi_free_pool(config->firmware_icon);
+    if (config->menu_sound)    efi_free_pool(config->menu_sound);
     config->background = NULL;
     config->theme = NULL;
     config->title = NULL;
@@ -3935,4 +3947,5 @@ void config_free(config_t *config) {
     config->shutdown_icon = NULL;
     config->reboot_icon = NULL;
     config->firmware_icon = NULL;
+    config->menu_sound = NULL;
 }

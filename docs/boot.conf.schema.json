@@ -642,6 +642,11 @@
       "description": "Logo edge length in pixels.",
       "$ref": "#/$defs/pixels"
     },
+    "menu_sound": {
+      "x-group": "sound",
+      "description": "WAV played once at startup when no Return by Death event fires. On by default, but plays only when a path is set; 'off', '0', 'n' or 'f' silences it. Audio must be 16-bit PCM, at most 4 seconds; it is upsampled and played through the HDA controller.",
+      "$ref": "#/$defs/path"
+    },
     "mouse": {
       "x-group": "appearance",
       "x-aliases": [

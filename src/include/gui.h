@@ -355,6 +355,9 @@ typedef struct gui_state {
     INTN    hp_shift;
     int     hp_removal;
 
+    void  (*sound_start)(void);
+    void  (*sound_poll)(void);
+
     int     mouse_enabled;
     UINTN   pointer_speed;
     void   *spp;
@@ -413,6 +416,10 @@ void gui_present(gui_state_t *state);
 void gui_present_band(gui_state_t *state, INTN y, INTN h);
 
 void gui_fade_out(gui_state_t *state);
+
+void gui_rbd_screen(gui_state_t *state);
+
+UINT32 rbd_scene_duration_ms(void);
 
 boot_entry_t* gui_run(gui_state_t *state);
 
