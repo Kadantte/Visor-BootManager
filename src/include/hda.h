@@ -3,33 +3,23 @@
 
 #include <efi.h>
 
-/* Intel HD Audio playback, just enough of it to play one short sound before
- * ExitBootServices. No interrupts, no mixing, no capture: set up a single
- * output stream, push samples through it, tear everything down.
- *
- * Codecs handled: Realtek (0x10EC), Conexant (0x14F1), Intel display audio
- * (0x8086) and AMD/ATI display audio (0x1002 / 0x1022). Anything else still
- * goes through the generic widget walk, which is often enough.
- *
- * Every entry point is safe to call on hardware without an HDA controller and
- * on AArch64, where the whole thing compiles to stubs.
- */
+/* Intel HD Audio playback: one short output stream before ExitBootServices.
+ * No interrupts, mixing or capture. Realtek/Conexant/Intel/AMD codecs; anything
+ * else goes through the generic widget walk. Stubs on AArch64 / no HDA. */
 
 #define HDA_SAMPLE_RATE   48000
 #define HDA_CHANNELS      2
 
-/* Bring-up budget: PCI scan, controller reset, codec enumeration and route
- * finding all have to fit in here. A boot must never be held up waiting on a
- * sound effect, so this is deliberately tight - a machine whose codec does not
- * answer promptly simply gets no sound.
- *
- * Once a stream is actually running the deadline extends by the length of the
- * sound plus a little slack, since by then we know the hardware works. */
+/* Bring-up budget - a boot must never wait on a sound effect. Once a stream is
+ * running the deadline extends by sound length plus slack. */
 #define HDA_SETUP_BUDGET_MS  400
 #define HDA_DRAIN_SLACK_MS   250
 
 /* Hard ceiling once a stream is running. */
 #define HDA_PLAY_BUDGET_MS   8000
+
+/* Teardown gets its own allowance; the play budget is typically spent by then. */
+#define HDA_CLEANUP_BUDGET_MS 200
 
 /* Why playback did not happen, for the boot log. */
 #define HDA_OK             0
